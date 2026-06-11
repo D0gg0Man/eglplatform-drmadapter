@@ -1,6 +1,6 @@
 # eglplatform-drmadapter
 
-hybris EGL platform for GNOME Shell on Mali GPU via Android HWC2.
+hybris EGL platform for GNOME Shell on Furi phone via Android HWC2.
 
 Set `HYBRIS_EGLPLATFORM=drmadapter` to activate.
 
