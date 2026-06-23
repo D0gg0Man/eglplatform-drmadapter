@@ -23,8 +23,20 @@
 #include <hybris/hwcomposerwindow/hwcomposer.h>
 
 #define LOG(fmt, ...) g_debug("drmadapter: " fmt, ##__VA_ARGS__)
-#define FRAME_W 1080
-#define FRAME_H 2412
+
+/* Panel dimensions are queried from HWC2 at init (never hardcoded). */
+static int frame_w = 0, frame_h = 0;
+
+/* Env-gated tracing (DRMADAPTER_TRACE=1) for diagnosing the HWC2 present
+ * path; no-op unless enabled. Writes to /tmp/drmadapter-trace.log. */
+#include <stdarg.h>
+static int dtrace = -1;
+static void dtracef(const char *fmt, ...) {
+    if (dtrace < 0) dtrace = getenv("DRMADAPTER_TRACE") ? 1 : 0;
+    if (!dtrace) return;
+    FILE *f = fopen("/tmp/drmadapter-trace.log", "a");
+    if (f) { va_list a; va_start(a, fmt); vfprintf(f, fmt, a); va_end(a); fclose(f); }
+}
 
 static hwc2_compat_device_t  *hwc2_dev   = NULL;
 static hwc2_compat_display_t *hwc2_disp  = NULL;
@@ -55,14 +67,24 @@ static void init_hwc2(void) {
     hwc2_compat_device_on_hotplug(hwc2_dev, 0, true);
     hwc2_disp = hwc2_compat_device_get_display_by_id(hwc2_dev, 0);
     if (!hwc2_disp) { LOG("no display"); goto out; }
+    /* Query the real panel geometry from HWC2 rather than hardcoding it. */
+    HWC2DisplayConfig *cfg = hwc2_compat_display_get_active_config(hwc2_disp);
+    if (cfg && cfg->width > 0 && cfg->height > 0) {
+        frame_w = cfg->width; frame_h = cfg->height;
+        LOG("panel %dx%d vsync=%lldns dpi=%.0fx%.0f", frame_w, frame_h,
+            (long long)cfg->vsyncPeriod, (double)cfg->dpiX, (double)cfg->dpiY);
+    } else {
+        LOG("ERROR: HWC2 active config unavailable; cannot determine panel size");
+        goto out;
+    }
     hwc2_compat_display_set_power_mode(hwc2_disp, 2);
     hwc2_compat_display_set_vsync_enabled(hwc2_disp, 1);
     hwc2_layer = hwc2_compat_display_create_layer(hwc2_disp);
     hwc2_compat_layer_set_composition_type(hwc2_layer, 4);
     hwc2_compat_layer_set_blend_mode(hwc2_layer, 1);
-    hwc2_compat_layer_set_source_crop(hwc2_layer, 0, 0, FRAME_W, FRAME_H);
-    hwc2_compat_layer_set_display_frame(hwc2_layer, 0, 0, FRAME_W, FRAME_H);
-    hwc2_compat_layer_set_visible_region(hwc2_layer, 0, 0, FRAME_W, FRAME_H);
+    hwc2_compat_layer_set_source_crop(hwc2_layer, 0, 0, frame_w, frame_h);
+    hwc2_compat_layer_set_display_frame(hwc2_layer, 0, 0, frame_w, frame_h);
+    hwc2_compat_layer_set_visible_region(hwc2_layer, 0, 0, frame_w, frame_h);
     hwc2_ready = 1;
     LOG("init_hwc2: done disp=%p layer=%p", (void*)hwc2_disp, (void*)hwc2_layer);
 out:
@@ -99,17 +121,23 @@ static void drmadapterws_eglInitialized(struct _EGLDisplay *dpy) {
     LOG("eglInitialized dpy=%p", (void*)dpy);
 }
 
-static struct ANativeWindow *hwc_native_win = NULL;
-
 static void present_cb(void *ud, struct ANativeWindow *w, struct ANativeWindowBuffer *buf) {
-    if (!hwc2_ready || !hwc2_disp || !hwc2_layer || !buf) return;
+    static unsigned long pn = 0;
+    pn++;
+    if (!hwc2_ready || !hwc2_disp || !hwc2_layer || !buf) {
+        dtracef("present_cb #%lu SKIP ready=%d disp=%p layer=%p buf=%p\n",
+                pn, hwc2_ready, (void*)hwc2_disp, (void*)hwc2_layer, (void*)buf);
+        return;
+    }
     uint32_t nt = 0, nr = 0;
-    hwc2_compat_display_validate(hwc2_disp, &nt, &nr);
+    int vr = hwc2_compat_display_validate(hwc2_disp, &nt, &nr);
     if (nt) hwc2_compat_display_accept_changes(hwc2_disp);
     hwc2_compat_layer_set_buffer(hwc2_layer, 0, buf, -1);
     hwc2_compat_display_set_client_target(hwc2_disp, 0, buf, -1, 0);
     int32_t fence = -1;
-    hwc2_compat_display_present(hwc2_disp, &fence);
+    int pr = hwc2_compat_display_present(hwc2_disp, &fence);
+    dtracef("present_cb #%lu validate=%d nt=%u nr=%u present=%d fence=%d buf=%p\n",
+            pn, vr, nt, nr, pr, fence, (void*)buf);
     HWCNativeBufferSetFence(buf, -1);
     if (fence >= 0) close(fence);
 }
@@ -127,16 +155,25 @@ static EGLNativeWindowType drmadapterws_CreateWindow(EGLNativeWindowType win,
         LOG("CreateWindow: HWC2 not ready after 5s, trying direct init");
         init_hwc2();
     }
-    if (!hwc_native_win && hwc2_disp) {
-        hwc_native_win = HWCNativeWindowCreate(FRAME_W, FRAME_H, HAL_PIXEL_FORMAT_RGBA_8888,
-                                               present_cb, NULL);
-        LOG("CreateWindow: created hwc_native_win=%p", (void*)hwc_native_win);
-    }
-    return (EGLNativeWindowType)hwc_native_win;
+    /* Create a FRESH native window for every surface. A single shared window
+     * is a use-after-free: eglDestroyWindowSurface() destroys the underlying
+     * HWCNativeWindow, so reusing one cached pointer hands mutter a dangling
+     * window after the first surface is torn down (e.g. on a scale change),
+     * and presents silently stop -> black screen. One window per surface lets
+     * eglDestroySurface reclaim each independently. */
+    struct ANativeWindow *w = NULL;
+    if (hwc2_disp && frame_w > 0 && frame_h > 0)
+        w = HWCNativeWindowCreate(frame_w, frame_h, HAL_PIXEL_FORMAT_RGBA_8888,
+                                  present_cb, NULL);
+    dtracef("CreateWindow win=%p -> fresh native=%p\n", (void*)win, (void*)w);
+    return (EGLNativeWindowType)w;
 }
 
 static void drmadapterws_DestroyWindow(EGLNativeWindowType win) {
+    /* eglDestroyWindowSurface() already destroys the HWCNativeWindow (see
+     * hwcomposer.h), so nothing to free here -- doing so would double-free. */
     LOG("DestroyWindow win=%p", (void*)win);
+    dtracef("DestroyWindow win=%p\n", (void*)win);
 }
 
 static __eglMustCastToProperFunctionPointerType
