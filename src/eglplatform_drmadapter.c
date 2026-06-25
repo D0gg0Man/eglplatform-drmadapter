@@ -73,6 +73,9 @@ static void init_hwc2(void) {
         frame_w = cfg->width; frame_h = cfg->height;
         LOG("panel %dx%d vsync=%lldns dpi=%.0fx%.0f", frame_w, frame_h,
             (long long)cfg->vsyncPeriod, (double)cfg->dpiX, (double)cfg->dpiY);
+        /* Pace libdrm-hybris's synthetic flip events at the real panel vsync. */
+        void (*set_vsync)(uint64_t) = (void(*)(uint64_t))dlsym(RTLD_DEFAULT, "drm_shim_set_vsync_period");
+        if (set_vsync && cfg->vsyncPeriod > 0) set_vsync((uint64_t)cfg->vsyncPeriod);
     } else {
         LOG("ERROR: HWC2 active config unavailable; cannot determine panel size");
         goto out;
@@ -91,10 +94,20 @@ out:
     pthread_mutex_unlock(&hwc2_mutex);
 }
 
+static int drmadapter_present_gralloc(buffer_handle_t handle);
+
 static void drmadapterws_init_module(struct ws_egl_interface *egl_iface) {
     LOG("init_module");
     eglplatformcommon_init(egl_iface);
     setenv("EGL_PLATFORM", "hwcomposer", 0);
+    /* Register our wlroots present callback into the globally-preloaded
+     * libdrm-hybris shim (reachable via RTLD_DEFAULT; this ws module is not). */
+    void (*set_present)(int (*)(buffer_handle_t)) =
+        (void (*)(int (*)(buffer_handle_t)))dlsym(RTLD_DEFAULT, "drm_shim_set_present");
+    if (set_present) {
+        set_present(drmadapter_present_gralloc);
+        LOG("registered drmadapter_present_gralloc with libdrm-hybris");
+    }
     pthread_t t;
     pthread_create(&t, NULL, (void*(*)(void*))init_hwc2, NULL);
     pthread_detach(t);
@@ -140,6 +153,39 @@ static void present_cb(void *ud, struct ANativeWindow *w, struct ANativeWindowBu
             pn, vr, nt, nr, pr, fence, (void*)buf);
     HWCNativeBufferSetFence(buf, -1);
     if (fence >= 0) close(fence);
+}
+
+/* wlroots presentation path.
+ *
+ * wlroots renders into a gbm_hybris (gralloc) buffer and scans it out with an
+ * atomic KMS commit. There is no drmadapter EGL window surface in that path, so
+ * present_cb (driven by mutter's eglSwapBuffers) never runs. libdrm-hybris's
+ * faked KMS commit instead calls back here with the committed gralloc handle;
+ * we look up the RemoteWindowBuffer libhybris already built for it (when
+ * wlroots imported it as an EGL image) and present it through the same HWC2
+ * display/layer. Registered into the globally-preloaded libdrm-hybris at init,
+ * because the ws module is dlopen()'d RTLD_LAZY (local) and is not otherwise
+ * reachable by the shim. */
+extern void *eglplatformcommon_wlr_lookup_anwb(buffer_handle_t handle);
+
+static int drmadapter_present_gralloc(buffer_handle_t handle) {
+    if (!hwc2_ready || !hwc2_disp || !hwc2_layer) return -1;
+    struct ANativeWindowBuffer *buf =
+        (struct ANativeWindowBuffer *)eglplatformcommon_wlr_lookup_anwb(handle);
+    if (!buf) return -1;
+    uint32_t nt = 0, nr = 0;
+    int vr = hwc2_compat_display_validate(hwc2_disp, &nt, &nr);
+    if (nt) hwc2_compat_display_accept_changes(hwc2_disp);
+    hwc2_compat_layer_set_buffer(hwc2_layer, 0, buf, -1);
+    hwc2_compat_display_set_client_target(hwc2_disp, 0, buf, -1, 0);
+    int32_t fence = -1;
+    int pr = hwc2_compat_display_present(hwc2_disp, &fence);
+    if (fence >= 0) close(fence);
+    static unsigned long pn = 0;
+    if ((pn++ % 120) == 0)
+        dtracef("present_gralloc #%lu handle=%p buf=%p validate=%d nt=%u present=%d\n",
+                pn, (void*)handle, (void*)buf, vr, nt, pr);
+    return 0;
 }
 
 static EGLNativeWindowType drmadapterws_CreateWindow(EGLNativeWindowType win,
