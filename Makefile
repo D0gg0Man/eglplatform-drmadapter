@@ -3,7 +3,7 @@ CFLAGS  = -O2 -fPIC -I/usr/include -I/usr/include/android \
           $(shell pkg-config --cflags glib-2.0)
 LDFLAGS = -shared -Wl,-soname,eglplatform_drmadapter.so
 LIBS    = -ldl -lhybris-common -lEGL \
-          -lhybris-eglplatformcommon -lhybris-hwcomposerwindow -lhwc2 \
+          -lhybris-eglplatformcommon -lhybris-hwcomposerwindow -lhwc2 -lGLESv2 \
           $(shell pkg-config --libs glib-2.0)
 
 all: eglplatform_drmadapter.so

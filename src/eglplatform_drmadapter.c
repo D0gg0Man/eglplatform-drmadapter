@@ -15,6 +15,8 @@
 #include <dlfcn.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 #include <hybris/eglplatformcommon/ws.h>
 #include <hybris/eglplatformcommon/eglplatformcommon.h>
 #include <hybris/gralloc/gralloc.h>
@@ -167,24 +169,189 @@ static void present_cb(void *ud, struct ANativeWindow *w, struct ANativeWindowBu
  * because the ws module is dlopen()'d RTLD_LAZY (local) and is not otherwise
  * reachable by the shim. */
 extern void *eglplatformcommon_wlr_lookup_anwb(buffer_handle_t handle);
+extern void *eglplatformcommon_wlr_make_anwb(buffer_handle_t handle);
+extern void *eglplatformcommon_wlr_display(void);
+extern void *eglplatformcommon_wlr_context(void);
+
+/* HWC2 only scans out buffers that come from its own HWCNativeWindow queue (the
+ * path mutter's eglSwapBuffers drives via present_cb). Presenting wlroots' raw
+ * gbm_hybris buffer through set_client_target returns success but never reaches
+ * the panel. So instead we run a tiny GLES2 blitter: import wlroots' rendered
+ * buffer as a texture and draw it into an HWCNativeWindow surface, then
+ * eglSwapBuffers -> present_cb -> HWC2. The window's buffer is HWC2-scanout
+ * compatible, so this actually lights up the display. */
+#ifndef EGL_NATIVE_BUFFER_ANDROID
+#define EGL_NATIVE_BUFFER_ANDROID 0x3140
+#endif
+static EGLDisplay   bl_dpy  = EGL_NO_DISPLAY;
+static EGLContext   bl_ctx  = EGL_NO_CONTEXT;
+static EGLSurface   bl_surf = EGL_NO_SURFACE;
+static struct ANativeWindow *bl_win = NULL;
+static GLuint       bl_prog = 0, bl_tex = 0, bl_pos = 0;
+static int          bl_ready = 0, bl_failed = 0;
+static PFNEGLCREATEIMAGEKHRPROC  p_eglCreateImageKHR;
+static PFNEGLDESTROYIMAGEKHRPROC p_eglDestroyImageKHR;
+static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC p_glEGLImageTargetTexture2DOES;
+
+static GLuint bl_shader(GLenum type, const char *src) {
+    GLuint s = glCreateShader(type);
+    glShaderSource(s, 1, &src, NULL);
+    glCompileShader(s);
+    GLint ok = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) { char log[512]; glGetShaderInfoLog(s, sizeof log, NULL, log); LOG("blit shader err: %s", log); }
+    return s;
+}
+
+static int blit_init(void) {
+    if (bl_ready) return 1;
+    if (bl_failed) return 0;
+    /* Use the SAME EGLDisplay handle wlroots imports its buffers on, captured by
+     * eglplatformcommon -- a different handle makes the buffer re-import fail. */
+    bl_dpy = (EGLDisplay)eglplatformcommon_wlr_display();
+    if (bl_dpy == EGL_NO_DISPLAY) bl_dpy = eglGetCurrentDisplay();
+    if (bl_dpy == EGL_NO_DISPLAY) bl_dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (bl_dpy == EGL_NO_DISPLAY) { bl_failed = 1; return 0; }
+    LOG("blit: using wlr EGLDisplay %p", (void*)bl_dpy);
+
+    EGLint cfgattr[] = {
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+        EGL_NONE
+    };
+    EGLConfig cfg; EGLint n = 0;
+    if (!eglChooseConfig(bl_dpy, cfgattr, &cfg, 1, &n) || n < 1) { LOG("blit: no EGL config"); bl_failed = 1; return 0; }
+
+    bl_win = HWCNativeWindowCreate(frame_w, frame_h, HAL_PIXEL_FORMAT_RGBA_8888, present_cb, NULL);
+    if (!bl_win) { LOG("blit: HWCNativeWindowCreate failed"); bl_failed = 1; return 0; }
+    bl_surf = eglCreateWindowSurface(bl_dpy, cfg, (EGLNativeWindowType)bl_win, NULL);
+    if (bl_surf == EGL_NO_SURFACE) { LOG("blit: eglCreateWindowSurface failed 0x%x", eglGetError()); bl_failed = 1; return 0; }
+    EGLint ctxattr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    bl_ctx = eglCreateContext(bl_dpy, cfg, EGL_NO_CONTEXT, ctxattr);
+    if (bl_ctx == EGL_NO_CONTEXT) { LOG("blit: eglCreateContext failed 0x%x", eglGetError()); bl_failed = 1; return 0; }
+
+    p_eglCreateImageKHR  = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+    p_eglDestroyImageKHR = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+    p_glEGLImageTargetTexture2DOES = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+    if (!p_eglCreateImageKHR || !p_glEGLImageTargetTexture2DOES) { LOG("blit: missing EGL image procs"); bl_failed = 1; return 0; }
+
+    EGLContext sc = eglGetCurrentContext();
+    EGLSurface sd = eglGetCurrentSurface(EGL_DRAW), sr = eglGetCurrentSurface(EGL_READ);
+    eglMakeCurrent(bl_dpy, bl_surf, bl_surf, bl_ctx);
+
+    static const char *vs =
+        "attribute vec2 pos;\nvarying vec2 uv;\n"
+        "void main(){ uv = vec2((pos.x+1.0)*0.5, (1.0-pos.y)*0.5); gl_Position = vec4(pos,0.0,1.0); }\n";
+    static const char *fs =
+        "precision mediump float;\nvarying vec2 uv;\nuniform sampler2D tex;\n"
+        "void main(){ gl_FragColor = texture2D(tex, uv); }\n";
+    bl_prog = glCreateProgram();
+    glAttachShader(bl_prog, bl_shader(GL_VERTEX_SHADER, vs));
+    glAttachShader(bl_prog, bl_shader(GL_FRAGMENT_SHADER, fs));
+    glBindAttribLocation(bl_prog, 0, "pos");
+    glLinkProgram(bl_prog);
+    bl_pos = 0;
+    glGenTextures(1, &bl_tex);
+    glBindTexture(GL_TEXTURE_2D, bl_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    /* Restore whatever was current (often nothing -- wlroots unbinds after
+     * rendering). Use bl_dpy, not eglGetCurrentDisplay(), which is nil here. */
+    eglMakeCurrent(bl_dpy, sd, sr, sc);
+    bl_ready = 1;
+    LOG("blit: initialised (%dx%d)", frame_w, frame_h);
+    return 1;
+}
+
+/* Per-handle cache of the imported EGLImage + GL texture for the blit source.
+ * The EGLImage references the gralloc buffer's live memory, so one import per
+ * buffer suffices -- sampling it each frame shows whatever wlroots last drew.
+ * A fresh RemoteWindowBuffer (not wlroots' own) is imported because Mali rejects
+ * a second eglCreateImageKHR on an already-imported ANativeWindowBuffer. Must be
+ * called with the blit context current. */
+#define BLIT_CACHE_MAX 8
+static struct { buffer_handle_t handle; EGLImageKHR img; GLuint tex; } bl_cache[BLIT_CACHE_MAX];
+static int bl_cache_n = 0;
+static GLuint blit_tex_for_handle(buffer_handle_t handle) {
+    for (int i = 0; i < bl_cache_n; i++)
+        if (bl_cache[i].handle == handle) {
+            /* Re-associate the EGLImage with the texture every frame: the image
+             * references the gralloc buffer's live memory, but the GL texture
+             * cache can hold a stale snapshot, so without re-binding the blit
+             * shows an old frame -> flicker. This is cheap (no re-import). */
+            glBindTexture(GL_TEXTURE_2D, bl_cache[i].tex);
+            p_glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)bl_cache[i].img);
+            return bl_cache[i].tex;
+        }
+    if (bl_cache_n >= BLIT_CACHE_MAX) return 0;
+    struct ANativeWindowBuffer *anwb =
+        (struct ANativeWindowBuffer *)eglplatformcommon_wlr_make_anwb(handle);
+    if (!anwb) return 0;
+    EGLImageKHR img = p_eglCreateImageKHR(bl_dpy, EGL_NO_CONTEXT,
+        EGL_NATIVE_BUFFER_ANDROID, (EGLClientBuffer)anwb, NULL);
+    if (img == EGL_NO_IMAGE_KHR) {
+        LOG("blit: eglCreateImageKHR(fresh anwb) failed 0x%x", eglGetError());
+        return 0;
+    }
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    p_glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)img);
+    bl_cache[bl_cache_n].handle = handle;
+    bl_cache[bl_cache_n].img = img;
+    bl_cache[bl_cache_n].tex = tex;
+    bl_cache_n++;
+    LOG("blit: cached image+texture for handle %p (tex %u)", (void*)handle, tex);
+    return tex;
+}
 
 static int drmadapter_present_gralloc(buffer_handle_t handle) {
-    if (!hwc2_ready || !hwc2_disp || !hwc2_layer) return -1;
-    struct ANativeWindowBuffer *buf =
+    if (!hwc2_ready || !hwc2_disp || !hwc2_layer || frame_w <= 0) return -1;
+    struct ANativeWindowBuffer *src =
         (struct ANativeWindowBuffer *)eglplatformcommon_wlr_lookup_anwb(handle);
-    if (!buf) return -1;
-    uint32_t nt = 0, nr = 0;
-    int vr = hwc2_compat_display_validate(hwc2_disp, &nt, &nr);
-    if (nt) hwc2_compat_display_accept_changes(hwc2_disp);
-    hwc2_compat_layer_set_buffer(hwc2_layer, 0, buf, -1);
-    hwc2_compat_display_set_client_target(hwc2_disp, 0, buf, -1, 0);
-    int32_t fence = -1;
-    int pr = hwc2_compat_display_present(hwc2_disp, &fence);
-    if (fence >= 0) close(fence);
+    if (!src) return -1;
+    if (!blit_init()) return -1;
+
+    /* Save wlroots' current EGL state (frequently nothing -- it unbinds after
+     * rendering), switch to the blitter, draw, swap. Restore via bl_dpy. */
+    EGLContext sc = eglGetCurrentContext();
+    EGLSurface sd = eglGetCurrentSurface(EGL_DRAW), sr = eglGetCurrentSurface(EGL_READ);
+
+    /* GPU sync is handled upstream now: libdrm-hybris reports DRM_CAP_SYNCOBJ_
+     * TIMELINE unsupported so wlroots uses implicit fencing on the buffer, which
+     * Mali honours when the blit samples it. (Making wlroots' own context
+     * current here to glFinish corrupted its rendering -> black, so we don't.) */
+    if (!eglMakeCurrent(bl_dpy, bl_surf, bl_surf, bl_ctx)) {
+        static int w = 0; if (!w) { LOG("blit: makecurrent failed 0x%x", eglGetError()); w = 1; }
+        return -1;
+    }
+
+    GLuint tex = blit_tex_for_handle(handle);
+    if (tex) {
+        glViewport(0, 0, frame_w, frame_h);
+        glUseProgram(bl_prog);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glUniform1i(glGetUniformLocation(bl_prog, "tex"), 0);
+        static const GLfloat quad[] = { -1,-1, 1,-1, -1,1, 1,1 };
+        glEnableVertexAttribArray(bl_pos);
+        glVertexAttribPointer(bl_pos, 2, GL_FLOAT, GL_FALSE, 0, quad);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glDisableVertexAttribArray(bl_pos);
+        eglSwapBuffers(bl_dpy, bl_surf); /* -> present_cb -> HWC2 */
+    }
+
+    eglMakeCurrent(bl_dpy, sd, sr, sc); /* restore wlroots state (sd/sc may be none) */
     static unsigned long pn = 0;
     if ((pn++ % 120) == 0)
-        dtracef("present_gralloc #%lu handle=%p buf=%p validate=%d nt=%u present=%d\n",
-                pn, (void*)handle, (void*)buf, vr, nt, pr);
+        dtracef("present_gralloc(blit) #%lu handle=%p tex=%u\n", pn, (void*)handle, tex);
     return 0;
 }
 
