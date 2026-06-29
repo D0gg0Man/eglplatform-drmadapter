@@ -171,7 +171,6 @@ static void present_cb(void *ud, struct ANativeWindow *w, struct ANativeWindowBu
 extern void *eglplatformcommon_wlr_lookup_anwb(buffer_handle_t handle);
 extern void *eglplatformcommon_wlr_make_anwb(buffer_handle_t handle);
 extern void *eglplatformcommon_wlr_display(void);
-extern void *eglplatformcommon_wlr_context(void);
 
 /* HWC2 only scans out buffers that come from its own HWCNativeWindow queue (the
  * path mutter's eglSwapBuffers drives via present_cb). Presenting wlroots' raw
@@ -428,21 +427,3 @@ struct ws_module ws_module_info = {
     .releaseDisplay      = drmadapterws_releaseDisplay,
     .eglInitialized      = drmadapterws_eglInitialized,
 };
-
-/* Fix EGL_NATIVE_VISUAL_ID to return GBM-compatible pixel formats */
-static void drmadapterws_getConfigAttrib(EGLDisplay *dpy, EGLConfig *config,
-                                          EGLint *attribute, EGLint *value) {
-    if (*attribute == EGL_NATIVE_VISUAL_ID && value && *value) {
-        EGLint alpha = 0;
-        typedef EGLBoolean (*getConfigAttrib_t)(EGLDisplay,EGLConfig,EGLint,EGLint*);
-        static getConfigAttrib_t real_fn = NULL;
-        if (!real_fn) real_fn = (getConfigAttrib_t)dlsym(RTLD_DEFAULT, "eglGetConfigAttrib");
-        if (real_fn) real_fn(*dpy, *config, EGL_ALPHA_SIZE, &alpha);
-        switch (*value) {
-            case 1: *value = alpha > 0 ? 0x34324241 : 0x34324258; break; /* RGBA/RGBX */
-            case 5: *value = alpha > 0 ? 0x34325241 : 0x34325258; break; /* RGBA/RGBX */
-            case 4: *value = 0x36314752; break; /* RG16 */
-            default: *value = 0x34324258; break; /* XRGB8888 */
-        }
-    }
-}
