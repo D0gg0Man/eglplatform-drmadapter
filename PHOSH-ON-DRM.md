@@ -1,0 +1,86 @@
+# phosh on the wlroots DRM backend, via hybris/HWC2 shims (FuriPhone FLX1)
+
+Run **phoc 0.55 / wlroots 0.20 on the wlroots *DRM* backend** (not the hwcomposer
+backend) on a Mali/Android-HWC2 device, with **phosh 0.55** as the client —
+GPU-accelerated, touch-working, stable/flicker-free — using only LD_PRELOAD/EGL
+shims plus a tiny wlroots patch. phoc and phosh sources are **unpatched**.
+
+This file is the reproduction recipe + the hard-won gotchas. Everything needed
+is on GitHub (see Components); the device-local scratchpad is not required.
+
+## Why this is hard
+HWC2/Android has no KMS for the compositor (the Android composer owns the CRTC,
+no DRM master). wlroots' DRM backend expects real atomic KMS + a GLES2 renderer
+on a Mesa-style EGL. We fake KMS, bridge the Mali (libhybris) EGL into wlroots,
+and scan out through the Android HWC2 path — all from outside phoc/wlroots.
+
+## Components (all D0gg0Man unless noted)
+| repo | branch | role |
+|---|---|---|
+| `libdrm-hybris` | `forky` | LD_PRELOAD: fake libseat + fake atomic KMS + synthetic page-flip clock + present wiring |
+| `eglplatform-drmadapter` | `main` | hybris EGL platform `drmadapter`: HWC2 init + the GLES2 **blitter** that scans wlroots' output out via an HWCNativeWindow |
+| `libgbm-hybris` | `main` | `hybris_gbm.so`: gbm backend allocating gralloc bos for wlroots' swapchain |
+| `libhybris` | `master` | `eglplatformcommon`: dmabuf→native EGLImage bridge + blitter helpers + `eglBindWaylandDisplayWL`→android_wlegl |
+| `wlroots` | `furios-0.20` | upstream v0.20.0 + 2 tiny patches (layer-shell leniency, EGL wl bind) |
+| phoc | `v0.55.0` (gitlab.gnome.org/World/Phosh/phoc) | UNPATCHED, built `-Dembed-wlroots=disabled` against our wlroots |
+| phosh | `v0.55.0` (gitlab.gnome.org/World/Phosh/phosh) | UNPATCHED client |
+
+phoc and phosh must be the SAME release (0.55 ↔ 0.55); a mismatch trips
+wlroots-0.20 layer-shell strictness (see gotchas).
+
+## Build
+- **wlroots 0.20** (D0gg0Man/wlroots `furios-0.20`): `meson setup build -Dxwayland=enabled` (needs xcb-* dev), `ninja -C build install` → `/usr/local`. The 2 FuriOS patches are already on that branch.
+- **phoc 0.55**: `meson setup build -Dembed-wlroots=disabled` (needs gnome-desktop-3-dev, wlr/xwayland.h), `ninja -C build` → run `build/src/phoc`.
+- **phosh 0.55**: build deps from its `debian/control`; `meson setup build --prefix=/usr -Dgtk_doc=false -Dtests=false -Dman=false`; `ninja -C build` → `build/src/phosh`. Run with `GSETTINGS_SCHEMA_DIR=build/data` (the installed 0.53 schemas lack `mobi.phosh.shell.plugins` → fatal otherwise).
+- **shims**: `make` in each repo; install `libdrm-hybris.so` (ld.so.preload), `hybris_gbm.so` → `…/gbm/`, `eglplatform_drmadapter.so` → `…/libhybris/`, `libhybris-eglplatformcommon.so.1.0.0`.
+
+## Launch — compositor (phoc on DRM)
+```sh
+export XDG_RUNTIME_DIR=/run/user/<uid>
+export XDG_SEAT=seat0 XDG_VTNR=7
+export XDG_DATA_DIRS=/usr/local/share:/usr/share
+export LD_LIBRARY_PATH=/usr/local/lib/aarch64-linux-gnu:<phoc>/build/src
+export WLR_DRM_DEVICES=/dev/dri/card0 WLR_RENDERER=gles2     # NB: do NOT set WLR_BACKENDS (auto = DRM+libinput)
+export GBM_BACKEND=hybris GBM_BACKENDS_PATH=/usr/lib/aarch64-linux-gnu/gbm HYBRIS_EGLPLATFORM=drmadapter
+export HYBRIS_WLROOTS=1                                       # gates the wlroots-specific shim paths
+export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_libhybris.json   # libhybris-only GLVND vendor
+export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libdrm-hybris.so:/usr/local/lib/wlegl_server.so
+exec <phoc>/build/src/phoc -v -C /etc/phosh/phoc.ini
+```
+
+## Launch — client (phosh)
+Plain wayland client; must NOT inherit the compositor's HYBRIS_WLROOTS/GBM_*:
+```sh
+export WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/<uid>
+export EGL_PLATFORM=wayland HYBRIS_EGLPLATFORM=drmadapter
+export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_libhybris.json
+export XDG_CURRENT_DESKTOP=Phosh:GNOME XDG_SESSION_TYPE=wayland GNOME_SHELL_SESSION_MODE=phosh
+unset HYBRIS_WLROOTS GBM_BACKEND GBM_BACKENDS_PATH WLR_DRM_DEVICES WLR_RENDERER WLR_BACKENDS
+export GSETTINGS_SCHEMA_DIR=<phosh>/build/data LD_LIBRARY_PATH=<phosh>/build/src
+# MUST disable idle blanking (see gotchas):
+dbus-run-session -- sh -c '
+  gsettings set org.gnome.desktop.session idle-delay 0
+  gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type nothing
+  gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type nothing
+  exec <phosh>/build/src/phosh'
+```
+
+## The hard-won gotchas (in causal order)
+1. **GLES2 renderer init**: force libhybris-only GLVND vendor; advertise `EGL_EXT_platform_base` + the Mali display exts (`EGL_KHR_no_config_context`, `surfaceless_context`, `image_dma_buf_import`) only under HYBRIS_WLROOTS. (eglplatformcommon / eglglvnd.)
+2. **Atomic KMS faked**: `drmModeAtomicCommit` returns 0; capture the real **FB_ID** and **CRTC_ID** from `drmModeAtomicAddProperty` — present the buffer the commit actually scans out, and tag the synthetic flip with the CRTC wlroots matches on (`handle_page_flip`/`drm_page_flip_pop`) or it drops the event and `frame_pending` wedges.
+3. **Synthetic page-flip clock**: wlroots commits non-blocking and waits for a flip event. Synthesize `DRM_EVENT_FLIP_COMPLETE` and deliver it through BOTH `poll/ppoll` AND `epoll` — phoc (GLib loop) nests the wayland epoll fd inside ppoll, so wake the outer ppoll on the epoll fd and inject the DRM-fd readiness in `epoll_wait`. Deliver IMMEDIATELY (vsync-pacing the synth flip → black). Real CRTC id required.
+4. **dmabuf → native EGLImage**: Mali imports gralloc ANativeWindowBuffers, not generic dmabufs. `eglplatformcommon` intercepts `eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT)` and re-imports as `EGL_NATIVE_BUFFER_ANDROID` (recovers the gralloc handle from the dmabuf fd via libgbm-hybris's registration). This is how wlroots' GLES2 renderer gets its output FBO.
+5. **Scan-out = blitter, NOT set_client_target**: HWC2 only scans out buffers from its own `HWCNativeWindow` queue (mutter's `eglSwapBuffers`→`present_cb`). Handing HWC2 a raw gbm buffer via `set_client_target` returns 0 but shows **nothing**. So `drmadapter_present_gralloc` runs a tiny GLES2 blit: import the committed buffer as a texture, draw it into an HWCNativeWindow surface, `eglSwapBuffers`→`present_cb`→HWC2. CPU gralloc sampling is a misleading "it works" signal — those HW_RENDER buffers aren't reliably CPU-mappable.
+6. **Blit requirements (all mandatory):**
+   - import a **FRESH** RemoteWindowBuffer (`eglplatformcommon_wlr_make_anwb`) — Mali rejects a 2nd `eglCreateImageKHR` on wlroots' already-imported ANWB (EGL_BAD_PARAMETER);
+   - create the EGLImage on **wlroots' own EGLDisplay** handle (`eglplatformcommon_wlr_display`) — a fresh `eglGetDisplay` handle → EGL_BAD_PARAMETER;
+   - **re-bind the EGLImage to the texture EVERY frame** (`glEGLImageTargetTexture2DOES`) — the GL texture cache holds a stale snapshot otherwise → **that is the flicker**.
+   - Do NOT glFinish on wlroots' context to sync (corrupts its rendering → black). Do NOT disable `DRM_CAP_SYNCOBJ_TIMELINE` (→ black).
+7. **GPU resolve sync (load-bearing!)**: before presenting, `copy_to_dumb` does a **full-frame read** of the committed gralloc buffer. Touching every pixel forces Mali to resolve its tiled render into the buffer before the blit samples it. It LOOKS like a wasteful 10 MB/frame memcpy but removing/shrinking it → black. Do not "optimize" it.
+8. **GPU client buffers (android_wlegl)**: the libhybris wayland-EGL client (phosh, GTK4) hard-requires the `android_wlegl` global, which only appears when the compositor calls `eglBindWaylandDisplayWL`. wlroots 0.20 dropped that (advertises its own wl_drm + linux-dmabuf), so without the wlroots patch phosh falls back to wl_shm software rendering. Patch: call `eglBindWaylandDisplayWL` from `wlr_renderer_init_wl_shm` (the path phoc uses).
+9. **layer-shell leniency (wlroots patch)**: phosh's draggable "phosh home" bar commits height 0 while only bottom-anchored before its drag surface sizes it; wlroots-0.20 protocol-errors and aborts phosh. Patch `wlr_layer_shell_v1.c` to warn instead.
+10. **Idle blanking must be off**: phosh DPMS-blanks the lockscreen after ~10s and the screen can't wake — phoc drops touch to a disabled output, so phosh never gets the wake input (DPMS-on through faked KMS is the dead end). Disable idle-delay/sleep in the session gsettings.
+
+## Status / open items
+- Works: phoc-on-DRM + GPU-accelerated phosh, stable, flicker-free, touch/gestures.
+- Not done: a productionized session (currently launched via scripts, not greetd/gnome-session); DPMS screen-wake through faked KMS.
