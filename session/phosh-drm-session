@@ -34,8 +34,12 @@ PHOC_PID=$!
 tail -n +1 -F "$PHOC_LOG" --pid "$PHOC_PID" 2>/dev/null &
 TAIL_PID=$!
 
+CLIENT_PID=""
+# Responsive teardown. systemd (KillMode=control-group) SIGTERMs phoc directly,
+# but we also tear it down here for the phosh-exits-on-its-own path. Clean phoc
+# shutdown is mandatory: it releases the singleton HWC2 composer client.
 cleanup() {
-    # Clean phoc shutdown is mandatory: it releases the HWC2 composer client.
+    [ -n "$CLIENT_PID" ] && kill -TERM "$CLIENT_PID" 2>/dev/null
     if kill -0 "$PHOC_PID" 2>/dev/null; then
         kill -TERM "$PHOC_PID" 2>/dev/null
         for _ in $(seq 1 80); do kill -0 "$PHOC_PID" 2>/dev/null || break; sleep 0.1; done
@@ -43,7 +47,9 @@ cleanup() {
     fi
     kill "$TAIL_PID" 2>/dev/null || true
 }
-trap cleanup EXIT TERM INT
+on_term() { cleanup; exit 0; }
+trap on_term TERM INT      # fires promptly: the client runs in the background
+trap cleanup EXIT
 
 # Wait for the output to actually come up (not just the socket) — racing the
 # blitter init with phosh's first buffers is what produced a black screen.
@@ -56,5 +62,9 @@ done
 [ "$ready" = 1 ] || { echo "phosh-drm: timed out waiting for phoc output" >&2; exit 1; }
 sleep 3   # settle: let the blitter finish its first present cycle
 
-# Client in the foreground; when it exits, the EXIT trap tears phoc down cleanly.
-/usr/libexec/phosh-drm-client
+# Client in the BACKGROUND + wait, so a SIGTERM trap fires promptly (a
+# foreground child would block the trap until it exits). When the client exits
+# or we're signalled, the traps tear phoc down cleanly.
+/usr/libexec/phosh-drm-client &
+CLIENT_PID=$!
+wait "$CLIENT_PID"

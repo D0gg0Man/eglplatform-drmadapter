@@ -18,9 +18,12 @@ as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -A "$@"; fi; }
 
 revert() {
     echo ">> Reverting to stock phosh"
-    as_root systemctl stop phosh-drm.service 2>/dev/null || true
-    as_root rm -f "$UPHOLD"                    # un-shadow -> packaged Upholds=phosh.service
+    # Remove the uphold FIRST: while android-service@hwcomposer Upholds=
+    # phosh-drm, systemd cancels any stop of it. Removing the shadow restores
+    # the packaged Upholds=phosh.service, so stopping phosh-drm then sticks.
+    as_root rm -f "$UPHOLD"
     as_root systemctl daemon-reload
+    as_root systemctl stop phosh-drm.service 2>/dev/null || true
     as_root systemctl start phosh.service
     echo ">> Stock phosh restored. (phosh-drm unit files left in place; disabled.)"
     exit 0

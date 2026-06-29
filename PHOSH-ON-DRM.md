@@ -104,8 +104,18 @@ Two service-specific gotchas (cost a lot of black screens):
 12. **Composer client is a singleton — phoc MUST exit cleanly.** A SIGKILL'd or
     orphaned phoc leaks the HWC2 composer client; the next phoc then aborts with
     `failed to create composer client` and the HAL is wedged (recover with
-    `setprop ctl.start vendor.hwcomposer-2-3`, or reboot). The launcher SIGTERMs
-    phoc and waits for exit; the unit uses `KillMode=mixed` + `TimeoutStopSec`.
+    `setprop ctl.start vendor.hwcomposer-2-3`, or reboot). phoc DOES release the
+    client on a clean SIGTERM, so the unit uses **`KillMode=control-group`**:
+    systemd SIGTERMs the whole cgroup, phoc gets the signal directly and shuts
+    down cleanly. Do NOT use `KillMode=mixed` — it signals only the launcher,
+    which is blocked waiting on the client, so phoc never gets SIGTERM, hits the
+    stop timeout, escapes the cgroup on the final SIGKILL, and leaks the client.
+    (The launcher also runs the client in the background + `wait` so its own
+    SIGTERM trap stays responsive for the phosh-exits-on-its-own path.)
+    NB: while `android-service@hwcomposer` `Upholds=phosh-drm.service`, systemd
+    cancels a manual `stop`/`restart` of phosh-drm (the uphold re-queues a
+    start) — fine for boot/crash-restart, but `swap-to-drm.sh revert` removes
+    the uphold first so the stop sticks.
 13. **Blitter-init race.** Launching phosh before phoc's output/blitter is fully
     up leaves a persistent black screen (the client's first buffers race the
     blitter's EGL setup). The launcher waits for `Output '…' added` + a settle

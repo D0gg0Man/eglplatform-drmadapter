@@ -39,12 +39,13 @@ PAMName=phosh-drm
 WorkingDirectory=~
 Restart=always
 RestartSec=5s
-# On stop, SIGTERM only the launcher (KillMode=mixed) so its trap can shut phoc
-# down cleanly and RELEASE the HWC2 composer client before anything is killed.
-# A leaked composer client wedges the next start ("failed to create composer
-# client"). Give it time.
-KillMode=mixed
-TimeoutStopSec=25
+# On stop, SIGTERM the WHOLE cgroup (default KillMode=control-group) so phoc
+# gets the signal directly and does its clean wlroots shutdown, RELEASING the
+# singleton HWC2 composer client. (KillMode=mixed signals only the launcher,
+# which is blocked on the foreground client, so its trap never fires and phoc
+# leaks the composer client -> next start aborts. Don't use mixed here.)
+KillMode=control-group
+TimeoutStopSec=10
 
 StandardInput=null
 StandardOutput=journal
