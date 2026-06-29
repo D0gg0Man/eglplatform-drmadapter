@@ -81,6 +81,38 @@ dbus-run-session -- sh -c '
 9. **layer-shell leniency (wlroots patch)**: phosh's draggable "phosh home" bar commits height 0 while only bottom-anchored before its drag surface sizes it; wlroots-0.20 protocol-errors and aborts phosh. Patch `wlr_layer_shell_v1.c` to warn instead.
 10. **Idle blanking must be off**: phosh DPMS-blanks the lockscreen after ~10s and the screen can't wake — phoc drops touch to a disabled output, so phosh never gets the wake input (DPMS-on through faked KMS is the dead end). Disable idle-delay/sleep in the session gsettings.
 
+## Productionized session (systemd)
+`session/` wires the stack as a real boot session on FuriOS, mirroring the
+gnome-mali installer pattern. Run `session/swap-to-drm.sh` to install + switch
+(`swap-to-drm.sh revert` to go back to stock phosh).
+- `phosh-drm-session` (→ `/usr/libexec`): launches phoc on DRM, waits for the
+  output to come up, **then** launches the client; owns clean teardown.
+- `phosh-drm-client` (→ `/usr/libexec`): scrubs the compositor-only env, runs
+  phosh under `dbus-run-session` with idle-blanking off.
+- `phosh-drm.service`: `OnFailure=phosh.service` (stock phosh is the fallback).
+- `android-uphold-phosh-drm.conf`: shadows the packaged drop-in so the
+  hwcomposer service upholds phosh-drm on boot.
+
+Two service-specific gotchas (cost a lot of black screens):
+11. **Seatless session, mandatory.** phoc drives the panel through the Android
+    HWC2 composer (which owns DRM master on card0) via the faked-libseat
+    blitter — NOT through logind. If pam_systemd registers a real seat0/VT7
+    graphical session (via `TTYPath=/dev/tty7` or `XDG_SEAT`/`XDG_VTNR`), logind
+    does VT/session-device management on card0 that fights the composer → black.
+    So the unit is deliberately seatless (no TTYPath, no XDG_SEAT/XDG_VTNR); the
+    logind session stays `Class=user Seat=none`, like the manual launch.
+12. **Composer client is a singleton — phoc MUST exit cleanly.** A SIGKILL'd or
+    orphaned phoc leaks the HWC2 composer client; the next phoc then aborts with
+    `failed to create composer client` and the HAL is wedged (recover with
+    `setprop ctl.start vendor.hwcomposer-2-3`, or reboot). The launcher SIGTERMs
+    phoc and waits for exit; the unit uses `KillMode=mixed` + `TimeoutStopSec`.
+13. **Blitter-init race.** Launching phosh before phoc's output/blitter is fully
+    up leaves a persistent black screen (the client's first buffers race the
+    blitter's EGL setup). The launcher waits for `Output '…' added` + a settle
+    before starting the client.
+
 ## Status / open items
-- Works: phoc-on-DRM + GPU-accelerated phosh, stable, flicker-free, touch/gestures.
-- Not done: a productionized session (currently launched via scripts, not greetd/gnome-session); DPMS screen-wake through faked KMS.
+- Works: phoc-on-DRM + GPU-accelerated phosh, stable, flicker-free,
+  touch/gestures, **as a productionized systemd session** (boots into it; stock
+  phosh is the OnFailure fallback).
+- Open: DPMS screen-wake through faked KMS.

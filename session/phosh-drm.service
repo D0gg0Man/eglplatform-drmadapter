@@ -1,0 +1,54 @@
+[Unit]
+Description=phosh 0.55 on the wlroots DRM backend (hybris/HWC2 shims)
+# Take over the role phosh had: replace the getty, fall back to stock phosh if
+# the DRM shell cannot come up.
+Conflicts=getty@tty1.service phosh.service
+After=getty@tty1.service phosh.service
+After=rc-local.service plymouth-quit-wait.service systemd-user-sessions.service
+After=dbus.socket session-c1.scope
+# HWC2 lives in the Android container; wait for it like phosh does.
+Requires=lxc@android.service
+After=lxc@android.service android-service@hwcomposer.service
+Wants=dbus.socket
+Before=graphical.target
+ConditionPathExists=/dev/tty0
+# If the DRM shell fails repeatedly, fall back to stock phosh (0.53).
+OnFailure=phosh.service
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Environment=LANG=C.UTF-8
+Environment=XDG_CURRENT_DESKTOP=Phosh:GNOME
+Environment=XDG_SESSION_DESKTOP=phosh
+Environment=XDG_SESSION_TYPE=wayland
+# IMPORTANT: deliberately SEATLESS. phoc drives the panel through the Android
+# HWC2 composer (which owns DRM master on card0) via the faked-libseat blitter,
+# NOT through logind. If pam_systemd registers a real seat0/VT7 graphical
+# session, logind does VT/session-device management on card0 that conflicts
+# with the composer's display ownership -> black screen. So: no TTYPath, no
+# XDG_SEAT, no XDG_VTNR. The PAM session stays Class=user with Seat=none, like
+# the proven manual launch.
+ExecStartPre=/bin/bash -c "WAITFORSERVICE_VALUE=1 waitforservice vendor.furios.hwcomposer.ready && sleep 3"
+ExecStart=/sbin/capsh --noamb -- -c "exec /usr/libexec/phosh-drm-session"
+# Make VT7 the visible console (the composer scans out independent of the VT).
+ExecStartPost=+/usr/bin/chvt 7
+TimeoutStartSec=60
+User=32011
+PAMName=phosh-drm
+WorkingDirectory=~
+Restart=always
+RestartSec=5s
+# On stop, SIGTERM only the launcher (KillMode=mixed) so its trap can shut phoc
+# down cleanly and RELEASE the HWC2 composer client before anything is killed.
+# A leaked composer client wedges the next start ("failed to create composer
+# client"). Give it time.
+KillMode=mixed
+TimeoutStopSec=25
+
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical.target

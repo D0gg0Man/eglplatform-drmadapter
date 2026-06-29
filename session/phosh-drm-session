@@ -1,0 +1,60 @@
+#!/bin/bash
+# Compositor side of the phosh-on-DRM session: phoc 0.55 on the wlroots DRM
+# backend via the hybris/HWC2 shims. Launched by phosh-drm.service.
+#
+# phoc and phosh run as SEPARATE processes (the proven flow). This script owns
+# both lifetimes and is careful about two device-specific hazards:
+#   1. The HWC2 composer client is a singleton — phoc MUST exit cleanly to
+#      release it, or the next phoc aborts with "failed to create composer
+#      client". So on teardown we SIGTERM phoc and WAIT for it to actually exit.
+#   2. The blitter/output must be fully up before phosh attaches — starting the
+#      client too early races the blitter init. So we wait for phoc's output to
+#      come up, then settle, before launching phosh.
+set -u
+
+PHOC="${PHOC:-/home/furios/repos/phoc-0.55/build/src/phoc}"
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export XDG_SEAT="${XDG_SEAT:-seat0}" XDG_VTNR="${XDG_VTNR:-7}"
+export XDG_DATA_DIRS=/usr/local/share:/usr/share
+export LD_LIBRARY_PATH=/usr/local/lib/aarch64-linux-gnu:$(dirname "$PHOC")
+export WLR_DRM_DEVICES=/dev/dri/card0 WLR_RENDERER=gles2   # do NOT set WLR_BACKENDS
+export GBM_BACKEND=hybris GBM_BACKENDS_PATH=/usr/lib/aarch64-linux-gnu/gbm HYBRIS_EGLPLATFORM=drmadapter
+export HYBRIS_WLROOTS=1
+export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_libhybris.json
+export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libdrm-hybris.so:/usr/local/lib/wlegl_server.so
+
+PHOC_LOG="$XDG_RUNTIME_DIR/phoc-drm.log"
+
+# Launch the compositor; tee its log to a file so we can detect readiness, and
+# mirror it to our stdout (the journal).
+: > "$PHOC_LOG"
+"$PHOC" -v -C /etc/phosh/phoc.ini >"$PHOC_LOG" 2>&1 &
+PHOC_PID=$!
+tail -n +1 -F "$PHOC_LOG" --pid "$PHOC_PID" 2>/dev/null &
+TAIL_PID=$!
+
+cleanup() {
+    # Clean phoc shutdown is mandatory: it releases the HWC2 composer client.
+    if kill -0 "$PHOC_PID" 2>/dev/null; then
+        kill -TERM "$PHOC_PID" 2>/dev/null
+        for _ in $(seq 1 80); do kill -0 "$PHOC_PID" 2>/dev/null || break; sleep 0.1; done
+        kill -KILL "$PHOC_PID" 2>/dev/null   # last resort if it hung
+    fi
+    kill "$TAIL_PID" 2>/dev/null || true
+}
+trap cleanup EXIT TERM INT
+
+# Wait for the output to actually come up (not just the socket) — racing the
+# blitter init with phosh's first buffers is what produced a black screen.
+ready=0
+for _ in $(seq 1 150); do   # up to ~30s
+    if grep -qE "Output '.*' added" "$PHOC_LOG" 2>/dev/null; then ready=1; break; fi
+    kill -0 "$PHOC_PID" 2>/dev/null || { echo "phosh-drm: phoc exited before output came up" >&2; exit 1; }
+    sleep 0.2
+done
+[ "$ready" = 1 ] || { echo "phosh-drm: timed out waiting for phoc output" >&2; exit 1; }
+sleep 3   # settle: let the blitter finish its first present cycle
+
+# Client in the foreground; when it exits, the EXIT trap tears phoc down cleanly.
+/usr/libexec/phosh-drm-client

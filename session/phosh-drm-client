@@ -1,0 +1,24 @@
+#!/bin/bash
+# Client side of the phosh-on-DRM session: phosh 0.55 as a plain wayland client
+# of the DRM phoc. exec'd by phoc (-E), so it must scrub the compositor-only
+# env (HYBRIS_WLROOTS / GBM_* / WLR_* / wlegl_server preload).
+PHOSH="${PHOSH:-/home/furios/repos/phosh-0.55/build/src/phosh}"
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+export EGL_PLATFORM=wayland HYBRIS_EGLPLATFORM=drmadapter
+export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_libhybris.json
+export XDG_CURRENT_DESKTOP=Phosh:GNOME XDG_SESSION_TYPE=wayland GNOME_SHELL_SESSION_MODE=phosh
+export XDG_DATA_DIRS=/usr/local/share:/usr/share
+unset HYBRIS_WLROOTS GBM_BACKEND GBM_BACKENDS_PATH WLR_DRM_DEVICES WLR_RENDERER WLR_BACKENDS LD_PRELOAD
+
+export LD_LIBRARY_PATH="$(dirname "$PHOSH")":$LD_LIBRARY_PATH
+export GSETTINGS_SCHEMA_DIR="$(dirname "$PHOSH")/../data"
+
+# Idle blanking must stay off: phoc drops touch to a disabled output so phosh
+# can never receive the wake input (see PHOSH-ON-DRM.md gotcha 10).
+exec dbus-run-session -- sh -c '
+  gsettings set org.gnome.desktop.session idle-delay 0
+  gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type nothing
+  gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type nothing
+  exec "$0"' "$PHOSH"
