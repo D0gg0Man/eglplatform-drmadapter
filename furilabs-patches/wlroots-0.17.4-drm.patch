@@ -1,0 +1,54 @@
+diff --git a/backend/hwcomposer/output.c b/backend/hwcomposer/output.c
+index a4c8a00..484bfb3 100644
+--- a/backend/hwcomposer/output.c
++++ b/backend/hwcomposer/output.c
+@@ -261,7 +261,7 @@ struct wlr_output *wlr_hwcomposer_add_output(struct wlr_backend *wlr_backend,
+ 	output->egl_window = HWCNativeWindowCreate(
+ 		output->hwc_width, output->hwc_height,
+ 		HAL_PIXEL_FORMAT_RGBA_8888, hwc_backend->impl->present, output);
+-	HWCNativeWindowSetBufferCount(output->egl_window, 3);
++	/* HWCNativeWindowSetBufferCount removed: not in this libhybris; hwcomposer backend unused (we use DRM) */
+ 
+ 	struct wl_event_loop *ev = wl_display_get_event_loop(hwc_backend->display);
+ 	output->vsync_timer = wl_event_loop_add_timer(ev, on_vsync_timer_elapsed, output);
+diff --git a/render/egl.c b/render/egl.c
+index e2bfa55..2447da6 100644
+--- a/render/egl.c
++++ b/render/egl.c
+@@ -45,6 +45,18 @@ static bool egl_get_config(EGLDisplay disp, const EGLint *attribs,
+ 		}
+ 	}
+ 
++	/* No config matched the requested native visual id. On the drmadapter/
++	 * hybris DRM path the Mali EGL configs carry GBM/DRM-fourcc visuals rather
++	 * than the android HAL_PIXEL_FORMAT, and we scan out through a blitter (not
++	 * a direct EGL window surface), so the visual id does not matter -- fall
++	 * back to the first matched config instead of failing. */
++	if (matched > 0) {
++		*out = configs[0];
++		wlr_log(WLR_DEBUG,
++			"no config matched native visual 0x%x; using first match", visual_id);
++		return true;
++	}
++
+ 	wlr_log(WLR_ERROR, "no valid egl config found");
+ 	return false;
+ }
+diff --git a/render/gles2/pass.c b/render/gles2/pass.c
+index 768e81d..5dab5b7 100644
+--- a/render/gles2/pass.c
++++ b/render/gles2/pass.c
+@@ -36,7 +36,12 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
+ 		clock_gettime(CLOCK_MONOTONIC, &timer->cpu_end);
+ 	}
+ 
+-	glFlush();
++	/* glFinish (not glFlush): on the drmadapter/hybris DRM path our atomic
++	 * commit is faked, so the kernel never waits on the render's implicit fence
++	 * before the blitter scans the buffer out -> it samples a still-rendering
++	 * frame => flicker. Block here until the render is actually complete (this
++	 * is the renderer's own context, the correct place to sync). */
++	glFinish();
+ 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+ 
+ 	pop_gles2_debug(renderer);

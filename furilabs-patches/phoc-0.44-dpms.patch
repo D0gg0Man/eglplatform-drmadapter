@@ -1,0 +1,125 @@
+diff --git a/src/desktop.c b/src/desktop.c
+index 785fb05..0200e57 100644
+--- a/src/desktop.c
++++ b/src/desktop.c
+@@ -1210,6 +1210,11 @@ phoc_desktop_notify_activity (PhocDesktop *self, PhocSeat *seat)
+   priv = phoc_desktop_get_instance_private (self);
+ 
+   wlr_idle_notifier_v1_notify_activity (priv->idle_notifier_v1, seat->seat);
++
++  /* drmadapter/hybris DRM: any input activity forces the panel back on (DPMS
++   * keeps the wlr output enabled, so phosh's lockscreen does not always request
++   * the wake itself). No-op when the shim is not loaded / panel already on. */
++  phoc_output_wake_panel (phoc_desktop_get_builtin_output (self));
+ }
+ 
+ gboolean
+diff --git a/src/output.c b/src/output.c
+index d54bac2..f8dc6a0 100644
+--- a/src/output.c
++++ b/src/output.c
+@@ -14,6 +14,7 @@
+ #include <wlr/types/wlr_compositor.h>
+ #include <wlr/types/wlr_gamma_control_v1.h>
+ #include <wlr/types/wlr_output_layout.h>
++#include <dlfcn.h>
+ #include <wlr/types/wlr_output_power_management_v1.h>
+ #include <wlr/types/wlr_matrix.h>
+ #include <wlr/types/wlr_xdg_shell.h>
+@@ -1743,6 +1744,56 @@ phoc_handle_output_manager_test (struct wl_listener *listener, void *data)
+ }
+ 
+ 
++/* Tell output-power-management clients (phosh) the real panel power state. We
++ * drive DPMS by toggling HWC2 panel power while keeping the wlr output enabled
++ * (no modeset -> no freeze on the faked-KMS DRM backend), so wlroots' own
++ * commit-based mode events never fire -- send them by hand or phosh desyncs
++ * (stops rendering on blank, never resumes -> lockscreen never shows). */
++static void
++phoc_output_send_power_mode (PhocOutput *output, gboolean on)
++{
++  PhocDesktop *desktop = phoc_server_get_desktop (phoc_server_get_default ());
++  struct wlr_output_power_manager_v1 *mgr = desktop->output_power_manager_v1;
++  struct wlr_output_power_v1 *power;
++
++  if (!mgr)
++    return;
++  wl_list_for_each (power, &mgr->output_powers, link) {
++    if (power->output == output->wlr_output)
++      zwlr_output_power_v1_send_mode (power->resource,
++                                      on ? ZWLR_OUTPUT_POWER_V1_MODE_ON
++                                         : ZWLR_OUTPUT_POWER_V1_MODE_OFF);
++  }
++}
++
++
++/* Force the panel back on (drmadapter/hybris faked-KMS) on input activity and
++ * repaint, so any tap/key wakes the screen even when phosh's lockscreen does
++ * not request the wake; also resync phosh's output-power state. Called from
++ * phoc_desktop_notify_activity(). */
++void
++phoc_output_wake_panel (PhocOutput *output)
++{
++  static int  (*panel_is_on) (void) = NULL;
++  static void (*panel_power) (int)  = NULL;
++  static gboolean resolved = FALSE;
++
++  if (output == NULL)
++    return;
++  if (!resolved) {
++    panel_is_on = dlsym (RTLD_DEFAULT, "drm_shim_panel_is_on");
++    panel_power = dlsym (RTLD_DEFAULT, "drm_shim_panel_power");
++    resolved = TRUE;
++  }
++  if (panel_is_on == NULL || panel_power == NULL || panel_is_on ())
++    return;
++
++  panel_power (1);
++  phoc_output_send_power_mode (output, TRUE);
++  phoc_output_damage_whole (output);
++}
++
++
+ void
+ phoc_output_handle_output_power_manager_set_mode (struct wl_listener *listener, void *data)
+ {
+@@ -1767,6 +1818,27 @@ phoc_output_handle_output_power_manager_set_mode (struct wl_listener *listener,
+     return;
+   }
+ 
++  /* On the faked-KMS/hybris (drmadapter) backend, disabling the wlr_output
++   * tears down the mode; the modeset on re-enable then wedges wlroots' frame
++   * scheduling and the screen freezes (and the lockscreen never shows). If the
++   * drmadapter shim is loaded, keep the output enabled and just toggle HWC2
++   * panel power (real backlight off/on) -- no modeset, no freeze. */
++  {
++    static void (*panel_power) (int) = NULL;
++    static gboolean resolved = FALSE;
++    if (!resolved) {
++      panel_power = dlsym (RTLD_DEFAULT, "drm_shim_panel_power");
++      resolved = TRUE;
++    }
++    if (panel_power) {
++      panel_power (enable);
++      phoc_output_send_power_mode (self, enable);
++      if (enable)
++        phoc_output_damage_whole (self);
++      return;
++    }
++  }
++
+   current = self->wlr_output->enabled;
+   if (enable == current)
+     return;
+diff --git a/src/output.h b/src/output.h
+index 2897c5f..732c6c4 100644
+--- a/src/output.h
++++ b/src/output.h
+@@ -133,6 +133,7 @@ void        phoc_output_handle_gamma_control_set_gamma (struct wl_listener *list
+ struct wlr_output *
+             phoc_output_get_wlr_output (PhocOutput *output);
+ void        phoc_output_damage_whole (PhocOutput *output);
++void        phoc_output_wake_panel (PhocOutput *output);
+ void        phoc_output_damage_from_view (PhocOutput *self, PhocView *view, bool whole);
+ void        phoc_output_damage_whole_drag_icon (PhocOutput   *self,
+                                                 PhocDragIcon *icon);
