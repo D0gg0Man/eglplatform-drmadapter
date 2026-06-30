@@ -98,6 +98,17 @@ out:
 
 static int drmadapter_present_gralloc(buffer_handle_t handle);
 
+/* DPMS: libdrm-hybris calls this when wlroots toggles the CRTC ACTIVE state, so
+ * we power the real panel down on blank and back up on wake (HWC2 power modes:
+ * 0=OFF, 1=DOZE, 2=ON). */
+static void drmadapter_set_power(int on) {
+    pthread_mutex_lock(&hwc2_mutex);
+    if (hwc2_ready && hwc2_disp)
+        hwc2_compat_display_set_power_mode(hwc2_disp, on ? 2 : 0);
+    pthread_mutex_unlock(&hwc2_mutex);
+    LOG("set_power -> %s", on ? "ON" : "OFF");
+}
+
 static void drmadapterws_init_module(struct ws_egl_interface *egl_iface) {
     LOG("init_module");
     eglplatformcommon_init(egl_iface);
@@ -109,6 +120,13 @@ static void drmadapterws_init_module(struct ws_egl_interface *egl_iface) {
     if (set_present) {
         set_present(drmadapter_present_gralloc);
         LOG("registered drmadapter_present_gralloc with libdrm-hybris");
+    }
+    /* Same for the DPMS power callback. */
+    void (*set_power)(void (*)(int)) =
+        (void (*)(void (*)(int)))dlsym(RTLD_DEFAULT, "drm_shim_set_power");
+    if (set_power) {
+        set_power(drmadapter_set_power);
+        LOG("registered drmadapter_set_power with libdrm-hybris");
     }
     pthread_t t;
     pthread_create(&t, NULL, (void*(*)(void*))init_hwc2, NULL);
