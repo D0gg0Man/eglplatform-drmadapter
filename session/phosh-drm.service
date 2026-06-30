@@ -37,8 +37,11 @@ TimeoutStartSec=60
 User=32011
 PAMName=phosh-drm
 WorkingDirectory=~
-Restart=always
-RestartSec=5s
+# Restart=no (not always): the launcher's render watchdog exits non-zero when
+# phosh never composites, and we want that to reach OnFailure=phosh.service
+# cleanly. Restart=always fights OnFailure (it re-queues a start), producing a
+# phosh-drm<->phosh flap. So let a failure fall straight through to stock phosh.
+Restart=no
 # On stop, SIGTERM the WHOLE cgroup (default KillMode=control-group) so phoc
 # gets the signal directly and does its clean wlroots shutdown, RELEASING the
 # singleton HWC2 composer client. (KillMode=mixed signals only the launcher,

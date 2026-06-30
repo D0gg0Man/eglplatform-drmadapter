@@ -122,7 +122,28 @@ Two service-specific gotchas (cost a lot of black screens):
     before starting the client.
 
 ## Status / open items
-- Works: phoc-on-DRM + GPU-accelerated phosh, stable, flicker-free,
-  touch/gestures, **as a productionized systemd session** (boots into it; stock
-  phosh is the OnFailure fallback).
+- Works **warm**: phoc-on-DRM + GPU-accelerated phosh, flicker-free,
+  touch/gestures, started from a running system (the systemd session was
+  confirmed flicker-free + touch when switched into from stock phosh).
+- **UNSOLVED — cold boot renders black.** After a fresh reboot, phosh-drm comes
+  up but phosh's content never paints: phoc renders fine (flip clock healthy,
+  `present_hwc2 rc=0`, ~1500 frames) but every composited buffer is black
+  (`center=000000`), phoc never logs `Stacked surface`, and phosh logs
+  `configures pending` — i.e. phosh creates its layer surfaces but never draws
+  into them. phosh reaches "ready" (main loop runs) yet its surfaces stay black.
+  Strongly correlated on a fresh boot with a session-service storm in the
+  throwaway `dbus-run-session`: `org.freedesktop.secrets` (gnome-keyring) times
+  out (120s), `org.gnome.Calls GetManagedObjects` times out (~27s). The graphics
+  shim is NOT at fault (the present path provably works). Once a fresh boot is
+  in this state it stays black **even warm**, so it is not purely uptime/timing.
+  Mitigations added but NOT yet shown to fix it (couldn't validate — black on
+  the test boot): (a) `phosh-drm-client` starts `gnome-keyring-daemon` in the
+  session bus so secrets resolves; (b) `phosh-drm-session` has a render watchdog
+  — if phosh never composites within ~30s it fails the unit so
+  `OnFailure=phosh.service` falls back to stock phosh (and `Restart=no` so the
+  failover doesn't flap). The clean fix is probably to run phosh inside a real
+  `gnome-session --session=phosh` (like stock `phosh-session`, which is
+  cold-boot-safe), but that is blocked here: our phoc 0.55 build's `-E` does not
+  spawn its child the way stock phoc 0.44 does, and `gnome-session` won't start
+  cleanly standalone against the shared systemd --user session state.
 - Open: DPMS screen-wake through faked KMS.

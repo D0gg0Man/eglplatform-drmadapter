@@ -67,4 +67,27 @@ sleep 3   # settle: let the blitter finish its first present cycle
 # or we're signalled, the traps tear phoc down cleanly.
 /usr/libexec/phosh-drm-client &
 CLIENT_PID=$!
+
+# Render watchdog: phosh must actually COMPOSITE (phoc logs "Stacked surface"
+# once the shell's surfaces are mapped) within a grace period. If it never
+# does, the screen is black (e.g. the cold-boot session-service hang) — touch a
+# flag, kill the client, and exit non-zero so the unit fails and
+# OnFailure=phosh.service falls back to stock phosh instead of stranding the
+# user at a black screen.
+WATCH_FAIL="$XDG_RUNTIME_DIR/phosh-drm.watchdog-fail"
+rm -f "$WATCH_FAIL"
+(
+    for _ in $(seq 1 150); do   # ~30s grace
+        grep -q 'Stacked surface' "$PHOC_LOG" 2>/dev/null && exit 0
+        kill -0 "$CLIENT_PID" 2>/dev/null || exit 0   # client gone; main wait handles it
+        sleep 0.2
+    done
+    echo "phosh-drm: shell never composited within grace period — failing over" >&2
+    : > "$WATCH_FAIL"
+    kill -TERM "$CLIENT_PID" 2>/dev/null
+) &
+WATCH_PID=$!
+
 wait "$CLIENT_PID"
+kill "$WATCH_PID" 2>/dev/null || true
+[ -f "$WATCH_FAIL" ] && { rm -f "$WATCH_FAIL"; exit 1; }

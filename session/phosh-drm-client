@@ -17,7 +17,15 @@ export GSETTINGS_SCHEMA_DIR="$(dirname "$PHOSH")/../data"
 
 # Idle blanking must stay off: phoc drops touch to a disabled output so phosh
 # can never receive the wake input (see PHOSH-ON-DRM.md gotcha 10).
+#
+# Start gnome-keyring inside the session bus BEFORE phosh. Without a full
+# gnome-session, the throwaway dbus-run-session has no org.freedesktop.secrets
+# provider, so on a fresh boot phosh blocks on a 120s secrets activation
+# timeout and never paints its surfaces -> black screen. Starting the keyring
+# here gives phosh the secrets service immediately (gotcha 14).
 exec dbus-run-session -- sh -c '
+  eval "$(gnome-keyring-daemon --start --components=secrets,pkcs11 2>/dev/null)"
+  export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
   gsettings set org.gnome.desktop.session idle-delay 0
   gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type nothing
   gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type nothing
