@@ -103,8 +103,14 @@ static int drmadapter_present_gralloc(buffer_handle_t handle);
  * 0=OFF, 1=DOZE, 2=ON). */
 static void drmadapter_set_power(int on) {
     pthread_mutex_lock(&hwc2_mutex);
-    if (hwc2_ready && hwc2_disp)
+    if (hwc2_ready && hwc2_disp) {
         hwc2_compat_display_set_power_mode(hwc2_disp, on ? 2 : 0);
+        /* Powering the display back on resets its vsync state; re-enable it so
+         * the present path (and the synthetic flip clock paced off it) keeps
+         * running, otherwise the first wake frame can land black. */
+        if (on)
+            hwc2_compat_display_set_vsync_enabled(hwc2_disp, 1);
+    }
     pthread_mutex_unlock(&hwc2_mutex);
     LOG("set_power -> %s", on ? "ON" : "OFF");
 }
