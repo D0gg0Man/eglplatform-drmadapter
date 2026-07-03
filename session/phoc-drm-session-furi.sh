@@ -28,6 +28,7 @@ export LD_LIBRARY_PATH=/usr/local/lib/aarch64-linux-gnu:$(dirname "$PHOC")
 export WLR_BACKENDS=drm,libinput WLR_RENDERER=gles2 WLR_DRM_DEVICES=/dev/dri/card0
 export GBM_BACKEND=hybris GBM_BACKENDS_PATH=/usr/lib/aarch64-linux-gnu/gbm HYBRIS_EGLPLATFORM=drmadapter
 export HYBRIS_WLROOTS=1
+export GBM_HYBRIS_LINEAR=1
 export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_libhybris.json
 export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libdrm-hybris.so:/usr/local/lib/wlegl_server.so
 
@@ -36,6 +37,32 @@ export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libdrm-hybris.so:/usr/local/lib/wle
 # any client after that is clean. Connect-init-disconnect once so the real
 # compositor starts in the good state. Harmless when already warm.
 /usr/libexec/hwc2-warmup 2>&1 | sed 's/^/phosh-drm: /' || true
+
+# Cold-boot warm cycle: the first REAL compositor session after boot can land in
+# a degraded composer state (gray/blur/flicker lottery) that a subsequent warm
+# restart reliably clears. Once per boot, run a full throwaway phoc cycle (EGL +
+# blitter init + a few presents, clean teardown) so the real session starts in
+# the proven-good warm state. /run is tmpfs, so the flag resets each boot.
+WARMFLAG="$XDG_RUNTIME_DIR/.drm-warm-cycled"
+if [ ! -e "$WARMFLAG" ]; then
+    echo "phosh-drm: cold boot detected -- running throwaway compositor cycle" >&2
+    WLOG="$XDG_RUNTIME_DIR/phoc-warmcycle.log"
+    : > "$WLOG"
+    "$PHOC" -C /etc/phosh/phoc.ini >"$WLOG" 2>&1 &
+    WPID=$!
+    for _ in $(seq 1 100); do
+        grep -qE "Output '.*' added" "$WLOG" 2>/dev/null && break
+        kill -0 "$WPID" 2>/dev/null || break
+        sleep 0.2
+    done
+    sleep 3   # let the blitter validate + present
+    kill -TERM "$WPID" 2>/dev/null
+    for _ in $(seq 1 80); do kill -0 "$WPID" 2>/dev/null || break; sleep 0.1; done
+    kill -KILL "$WPID" 2>/dev/null
+    touch "$WARMFLAG"
+    sleep 2   # let the composer settle after the client disconnect
+    echo "phosh-drm: warm cycle done" >&2
+fi
 
 PHOC_LOG="$XDG_RUNTIME_DIR/phoc-drm.log"
 HEARTBEAT="$XDG_RUNTIME_DIR/drmadapter.heartbeat"

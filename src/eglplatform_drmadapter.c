@@ -386,7 +386,7 @@ static int bl_buf_init(int i) {
     nb->width  = frame_w;
     nb->height = frame_h;
     nb->stride = bl_buf[i].stride;
-    nb->format = 1;
+    nb->format = 1; /* RGBA_8888, matches the allocation */
     nb->usage  = usage;
     nb->handle = bl_buf[i].handle;
 
@@ -471,34 +471,71 @@ static int blit_init(void) {
         }
     }
 
-    /* End-to-end validation: GPU-clear each buffer to a known value and verify
-     * BOTH through GL readback and through the CPU (gralloc lock). The CPU view
-     * is what the display controller scans, so this catches any buffer whose
-     * GPU writes don't land in memory. */
-    for (int i = 0; i < BL_NBUF; i++) {
-        glBindFramebuffer(GL_FRAMEBUFFER, bl_buf[i].fbo);
-        glViewport(0, 0, frame_w, frame_h);
-        glClearColor(32.0f/255.0f, 32.0f/255.0f, 32.0f/255.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-        glFinish();
-        unsigned char px[4] = {0};
-        glReadPixels(frame_w/2, frame_h/2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
-        int gl_ok = (px[0] >= 24 && px[0] <= 40);
-        int cpu_ok = 0;
-        void *va = NULL;
-        if (hybris_gralloc_lock(bl_buf[i].handle, 0x3, 0, 0, frame_w, frame_h, &va) == 0 && va) {
-            unsigned char *p2 = (unsigned char*)va +
-                (size_t)(frame_h/2) * bl_buf[i].stride * 4 + (size_t)(frame_w/2) * 4;
-            cpu_ok = (p2[0] >= 24 && p2[0] <= 40);
-            hybris_gralloc_unlock(bl_buf[i].handle);
+    /* End-to-end validation using the REAL runtime path: draw a textured quad
+     * (the same shader the blit uses) into each buffer and verify through the
+     * CPU (gralloc lock) -- the CPU view is what the display controller scans.
+     * A per-allocation lottery can hand out buffers where plain clears land but
+     * SHADER writes never reach memory (the gray-glass boots); when a buffer
+     * fails, free and reallocate ALL of them and try again. */
+    {
+        GLuint vtex = 0;
+        static const unsigned char graytex[4] = { 96, 96, 96, 255 };
+        glGenTextures(1, &vtex);
+        glBindTexture(GL_TEXTURE_2D, vtex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, graytex);
+        int attempt;
+        for (attempt = 0; attempt < 8; attempt++) {
+            int bad = 0;
+            for (int i = 0; i < BL_NBUF; i++) {
+                glBindFramebuffer(GL_FRAMEBUFFER, bl_buf[i].fbo);
+                glViewport(0, 0, frame_w, frame_h);
+                glClearColor(0, 0, 0, 1);
+                glClear(GL_COLOR_BUFFER_BIT);
+                glUseProgram(bl_prog);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, vtex);
+                glUniform1i(glGetUniformLocation(bl_prog, "tex"), 0);
+                static const GLfloat q[] = { -1,-1, 1,-1, -1,1, 1,1 };
+                glEnableVertexAttribArray(bl_pos);
+                glVertexAttribPointer(bl_pos, 2, GL_FLOAT, GL_FALSE, 0, q);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                glDisableVertexAttribArray(bl_pos);
+                glFinish();
+                int cpu_ok = 0;
+                void *va = NULL;
+                if (hybris_gralloc_lock(bl_buf[i].handle, 0x3, 0, 0, frame_w, frame_h, &va) == 0 && va) {
+                    unsigned char *p2 = (unsigned char*)va +
+                        (size_t)(frame_h/2) * bl_buf[i].stride * 4 + (size_t)(frame_w/2) * 4;
+                    cpu_ok = (p2[0] >= 80 && p2[0] <= 112);
+                    hybris_gralloc_unlock(bl_buf[i].handle);
+                }
+                if (!cpu_ok) bad++;
+            }
+            if (bad == 0) break;
+            fprintf(stderr, "drmadapter: %d/%d present buffers fail shader-path validation, reallocating (attempt %d)\n",
+                    bad, BL_NBUF, attempt + 1);
+            for (int i = 0; i < BL_NBUF; i++) {
+                glDeleteFramebuffers(1, &bl_buf[i].fbo);
+                glDeleteTextures(1, &bl_buf[i].tex);
+                if (bl_buf[i].img != EGL_NO_IMAGE_KHR) p_eglDestroyImageKHR(bl_dpy, bl_buf[i].img);
+                if (bl_buf[i].handle) hybris_gralloc_release(bl_buf[i].handle, 1);
+                memset(&bl_buf[i], 0, sizeof bl_buf[i]);
+            }
+            int fail = 0;
+            for (int i = 0; i < BL_NBUF; i++)
+                if (!bl_buf_init(i)) { fail = 1; break; }
+            if (fail) { eglMakeCurrent(bl_dpy, sd, sr, sc); bl_failed = 1; return 0; }
         }
-        fprintf(stderr, "drmadapter: present buffer %d validation: GL=%s CPU=%s\n",
-                i, gl_ok ? "ok" : "FAIL", cpu_ok ? "ok" : "FAIL");
-        if (!gl_ok || !cpu_ok) {
-            fprintf(stderr, "drmadapter: present buffer %d NOT scan-safe; presents disabled\n", i);
+        glDeleteTextures(1, &vtex);
+        if (attempt >= 8) {
+            fprintf(stderr, "drmadapter: present buffers never validated; presents disabled\n");
             eglMakeCurrent(bl_dpy, sd, sr, sc);
             bl_failed = 1; return 0;
         }
+        fprintf(stderr, "drmadapter: present buffers validated (shader path, %d realloc%s)\n",
+                attempt, attempt == 1 ? "" : "s");
     }
 
     eglMakeCurrent(bl_dpy, sd, sr, sc);
@@ -571,6 +608,59 @@ static int drmadapter_present_gralloc(buffer_handle_t handle) {
     if (!eglMakeCurrent(bl_dpy, bl_surf, bl_surf, bl_ctx)) {
         static int w = 0; if (!w) { LOG("blit: makecurrent failed 0x%x", eglGetError()); w = 1; }
         return -1;
+    }
+
+    /* DEFAULT: copy the (linear) source buffer into the present buffer with
+     * the CPU -- no GL sampling at all. Cross-context EGLImage sampling of the
+     * source was the last unreliable link (stale snapshots = ghosting/trailing
+     * under motion, per-boot severity); the CPU copy is byte-exact and
+     * deterministic, and comfortably fast for linear buffers. Set
+     * DRMADAPTER_GL_BLIT=1 to use the GL sampling path instead. */
+    {
+        static int cpu_copy = -1;
+        if (cpu_copy < 0) { const char *e = getenv("DRMADAPTER_GL_BLIT"); cpu_copy = (e && *e == '1') ? 0 : 1; }
+        if (cpu_copy) {
+            int i2 = bl_cur;
+            bl_cur = (bl_cur + 1) % BL_NBUF;
+            void *sv = NULL, *dv = NULL;
+            if (hybris_gralloc_lock(handle, 0x3, 0, 0, frame_w, frame_h, &sv) == 0 && sv) {
+                if (hybris_gralloc_lock(bl_buf[i2].handle, 0x30, 0, 0, frame_w, frame_h, &dv) == 0 && dv) {
+                    size_t spitch = (size_t)bl_buf[i2].stride * 4; /* same allocator/params */
+                    /* Copy with a red/blue channel swap: wlroots' buffer holds
+                     * XRGB little-endian (B,G,R,X bytes) while the present
+                     * buffer is scanned as RGBA -- a raw copy shows swapped
+                     * colors. The word swizzle auto-vectorizes to NEON. */
+                    for (int y = 0; y < frame_h; y++) {
+                        const uint32_t *sp = (const uint32_t *)((const char*)sv + (size_t)y * spitch);
+                        uint32_t *dp = (uint32_t *)((char*)dv + (size_t)y * spitch);
+                        for (int x = 0; x < frame_w; x++) {
+                            uint32_t v = sp[x];
+                            dp[x] = (v & 0xFF00FF00u) | ((v >> 16) & 0xFFu) | ((v & 0xFFu) << 16);
+                        }
+                    }
+                    hybris_gralloc_unlock(bl_buf[i2].handle);
+                }
+                hybris_gralloc_unlock(handle);
+            }
+            eglMakeCurrent(bl_dpy, sd, sr, sc);
+            uint32_t nt2 = 0, nr2 = 0;
+            int vr2 = hwc2_compat_display_validate(hwc2_disp, &nt2, &nr2);
+            if (vr2 != 0 && vr2 != 5) return -1;
+            if (nt2) hwc2_compat_display_accept_changes(hwc2_disp);
+            hwc2_compat_layer_set_buffer(hwc2_layer, (uint32_t)i2, &bl_buf[i2].anwb, -1);
+            hwc2_compat_display_set_client_target(hwc2_disp, (uint32_t)i2, &bl_buf[i2].anwb, -1, 0);
+            int32_t f2 = -1;
+            hwc2_compat_display_present(hwc2_disp, &f2);
+            if (f2 >= 0) close(f2);
+            static int hb2 = -2; static const char *hbp2;
+            if (hb2 == -2) { hbp2 = getenv("DRMADAPTER_HEARTBEAT"); hb2 = hbp2 ? 1 : 0; }
+            static unsigned long okn2 = 0;
+            if (hb2 && ((okn2++ % 3) == 0)) {
+                FILE *f = fopen(hbp2, "w");
+                if (f) { fprintf(f, "%lu\n", okn2); fclose(f); }
+            }
+            return 0;
+        }
     }
 
     GLuint tex = blit_tex_for_handle(handle);
