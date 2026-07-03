@@ -284,6 +284,49 @@ index 2897c5f..173e3c3 100644
  void        phoc_output_damage_from_view (PhocOutput *self, PhocView *view, bool whole);
  void        phoc_output_damage_whole_drag_icon (PhocOutput   *self,
                                                  PhocDragIcon *icon);
+diff --git a/src/render.c b/src/render.c
+index b181c48..681f363 100644
+--- a/src/render.c
++++ b/src/render.c
+@@ -17,6 +17,7 @@
+ #include "seat.h"
+ #include "server.h"
+ #include "render.h"
++#include <dlfcn.h>
+ #include "render-private.h"
+ #include "xwayland-surface.h"
+ #include "utils.h"
+@@ -607,6 +608,30 @@ phoc_renderer_render_view_to_buffer (PhocRenderer      *self,
+ 
+   wlr_renderer_read_pixels (self->wlr_renderer,
+                             DRM_FORMAT_ARGB8888, stride, width, height, 0, 0, 0, 0, data);
++
++  /* drmadapter/gles2 path: Mali's glReadPixels returns the image vertically
++   * flipped (FBO vs window origin) and in RGBA byte order while the consumer
++   * expects ARGB little-endian (B,G,R,A) -- thumbnails showed upside down with
++   * red/blue swapped. Fix both in place. */
++  if (dlsym (RTLD_DEFAULT, "drm_shim_panel_is_on")) {
++    uint8_t *rows = data;
++    for (int32_t y = 0; y < height / 2; y++) {
++      uint32_t *a = (uint32_t *)(rows + (size_t)y * stride);
++      uint32_t *b = (uint32_t *)(rows + (size_t)(height - 1 - y) * stride);
++      for (int32_t x = 0; x < width; x++) {
++        uint32_t va = a[x], vb = b[x];
++        a[x] = (vb & 0xFF00FF00u) | ((vb >> 16) & 0xFFu) | ((vb & 0xFFu) << 16);
++        b[x] = (va & 0xFF00FF00u) | ((va >> 16) & 0xFFu) | ((va & 0xFFu) << 16);
++      }
++    }
++    if (height & 1) {
++      uint32_t *m = (uint32_t *)(rows + (size_t)(height / 2) * stride);
++      for (int32_t x = 0; x < width; x++) {
++        uint32_t v = m[x];
++        m[x] = (v & 0xFF00FF00u) | ((v >> 16) & 0xFFu) | ((v & 0xFFu) << 16);
++      }
++    }
++  }
+   wlr_renderer_end (self->wlr_renderer);
+ 
+   wlr_buffer_drop (buffer);
 diff --git a/src/server.c b/src/server.c
 index dc44f82..44ad749 100644
 --- a/src/server.c
