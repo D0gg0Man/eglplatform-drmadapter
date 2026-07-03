@@ -10,8 +10,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <poll.h>
+#include <time.h>
 #include <dlfcn.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -51,7 +54,15 @@ hwc2_compat_display_t *drmadapter_get_hwc2_display(void) { return hwc2_disp; }
 hwc2_compat_layer_t   *drmadapter_get_hwc2_layer(void)   { return hwc2_layer; }
 
 static void on_hotplug(HWC2EventListener *s,int32_t q,hwc2_display_t d,bool c,bool p){}
-static void on_vsync(HWC2EventListener *s,int32_t q,hwc2_display_t d,int64_t t){}
+static void on_vsync(HWC2EventListener *s,int32_t q,hwc2_display_t d,int64_t t){
+    /* Feed real panel vsync timestamps to libdrm-hybris so it phase-aligns the
+     * synthetic flip deadlines to the actual vblank (kills the present/latch
+     * beat that showed as motion flicker with session-random severity). */
+    static void (*stamp)(int64_t) = NULL;
+    static int resolved = 0;
+    if (!resolved) { stamp = (void(*)(int64_t))dlsym(RTLD_DEFAULT, "drm_shim_vsync_stamp"); resolved = 1; }
+    if (stamp) stamp(t);
+}
 static void on_refresh(HWC2EventListener *s,int32_t q,hwc2_display_t d){}
 
 static void init_hwc2(void) {
@@ -101,18 +112,82 @@ static int drmadapter_present_gralloc(buffer_handle_t handle);
 /* DPMS: libdrm-hybris calls this when wlroots toggles the CRTC ACTIVE state, so
  * we power the real panel down on blank and back up on wake (HWC2 power modes:
  * 0=OFF, 1=DOZE, 2=ON). */
-static void drmadapter_set_power(int on) {
-    pthread_mutex_lock(&hwc2_mutex);
-    if (hwc2_ready && hwc2_disp) {
-        hwc2_compat_display_set_power_mode(hwc2_disp, on ? 2 : 0);
-        /* Powering the display back on resets its vsync state; re-enable it so
-         * the present path (and the synthetic flip clock paced off it) keeps
-         * running, otherwise the first wake frame can land black. */
-        if (on)
-            hwc2_compat_display_set_vsync_enabled(hwc2_disp, 1);
+/* Path to the panel backlight. HWC2 set_power_mode(OFF) reliably wedges phoc's
+ * faked-KMS present loop (input dies, frame clock stalls, never recovers), so we
+ * "blank" softly instead: drop the backlight brightness and leave HWC2 powered
+ * on. The compositor then just idles like any static screen (which never freezes)
+ * and wake is simply restoring the brightness. Override the path with
+ * DRMADAPTER_BACKLIGHT if the device differs. */
+static const char *backlight_path(void) {
+    static const char *p = NULL;
+    if (!p) {
+        p = getenv("DRMADAPTER_BACKLIGHT");
+        if (!p || !*p) p = "/sys/class/leds/lcd-backlight/brightness";
     }
-    pthread_mutex_unlock(&hwc2_mutex);
-    LOG("set_power -> %s", on ? "ON" : "OFF");
+    return p;
+}
+static int backlight_read(void) {
+    FILE *f = fopen(backlight_path(), "r");
+    if (!f) return -1;
+    int v = -1;
+    if (fscanf(f, "%d", &v) != 1) v = -1;
+    fclose(f);
+    return v;
+}
+static void backlight_write(int v) {
+    FILE *f = fopen(backlight_path(), "w");
+    if (!f) return;
+    fprintf(f, "%d\n", v);
+    fclose(f);
+}
+
+static int g_saved_brightness = -1;
+
+static int g_backlight_owner = -1;  /* -1 unknown; 1 = we own it; 0 = phosh/gsd owns it */
+
+static void drmadapter_set_power(int on) {
+    if (g_backlight_owner < 0) {
+        /* DRMADAPTER_BACKLIGHT_OWNER=1 -> we drive the backlight on DPMS.
+         * default (0) -> leave it to phosh/gsd; we only avoid the HWC2 power
+         * toggle that wedges the present loop. */
+        const char *e = getenv("DRMADAPTER_BACKLIGHT_OWNER");
+        g_backlight_owner = (e && *e == '1') ? 1 : 0;
+    }
+    if (g_backlight_owner) {
+        if (on) {
+            int v = g_saved_brightness;
+            if (v <= 0) {
+                FILE *f = fopen("/sys/class/leds/lcd-backlight/max_brightness", "r");
+                int mx = 0;
+                if (f) { if (fscanf(f, "%d", &mx) != 1) mx = 0; fclose(f); }
+                v = mx > 0 ? mx / 2 : 1;
+            }
+            backlight_write(v);
+        } else {
+            int cur = backlight_read();
+            if (cur > 0)
+                g_saved_brightness = cur;
+            backlight_write(0);
+        }
+    }
+    /* Real HWC2 DPMS (actual panel off), gated on DRMADAPTER_HWC2_DPMS=1. This
+     * historically wedged the faked-KMS frame clock on the off->on cycle; now
+     * that libdrm-hybris's eventfd flip-wake delivers synth flips promptly even
+     * from an idle loop, re-test whether the power cycle survives. Off by default
+     * (backlight-only "blank" via phosh). */
+    {
+        static int hwc2_dpms = -1;
+        if (hwc2_dpms < 0) { const char *e = getenv("DRMADAPTER_HWC2_DPMS"); hwc2_dpms = (e && *e == '1') ? 1 : 0; }
+        if (hwc2_dpms) {
+            pthread_mutex_lock(&hwc2_mutex);
+            if (hwc2_ready && hwc2_disp) {
+                hwc2_compat_display_set_power_mode(hwc2_disp, on ? 2 : 0);
+                if (on) hwc2_compat_display_set_vsync_enabled(hwc2_disp, 1);
+            }
+            pthread_mutex_unlock(&hwc2_mutex);
+        }
+    }
+    LOG("set_power -> %s (owner=%d)", on ? "ON" : "OFF", g_backlight_owner);
 }
 
 static void drmadapterws_init_module(struct ws_egl_interface *egl_iface) {
@@ -163,6 +238,21 @@ static void drmadapterws_eglInitialized(struct _EGLDisplay *dpy) {
 static void present_cb(void *ud, struct ANativeWindow *w, struct ANativeWindowBuffer *buf) {
     static unsigned long pn = 0;
     pn++;
+    /* The buffer arrives carrying Mali's render-complete (acquire) fence from
+     * queueBuffer. It MUST be closed every frame -- leaking it exhausts the
+     * process fd table after ~900 frames (915 stranded sync_files at the 1024
+     * limit) and then EVERYTHING needing an fd fails: presents stop (screen
+     * freezes stale), new wayland clients can't connect, Xwayland dies. Do NOT
+     * hand it to HWC2 as the acquire fence though: on this faked-KMS pipeline
+     * that fence doesn't reliably signal for HWC2 and it scans out NOTHING
+     * (pure black panel while present() returns 0). Rendering completion is
+     * already guaranteed upstream (glFinish in the wlroots render submit), so
+     * present without an acquire fence -- the long-proven visible path. */
+    if (buf) {
+        int acquire = HWCNativeBufferGetFence(buf);
+        if (acquire >= 0) close(acquire);
+        HWCNativeBufferSetFence(buf, -1); /* clear slot so the window won't also close it */
+    }
     if (!hwc2_ready || !hwc2_disp || !hwc2_layer || !buf) {
         dtracef("present_cb #%lu SKIP ready=%d disp=%p layer=%p buf=%p\n",
                 pn, hwc2_ready, (void*)hwc2_disp, (void*)hwc2_layer, (void*)buf);
@@ -170,14 +260,51 @@ static void present_cb(void *ud, struct ANativeWindow *w, struct ANativeWindowBu
     }
     uint32_t nt = 0, nr = 0;
     int vr = hwc2_compat_display_validate(hwc2_disp, &nt, &nr);
-    if (nt) hwc2_compat_display_accept_changes(hwc2_disp);
-    hwc2_compat_layer_set_buffer(hwc2_layer, 0, buf, -1);
-    hwc2_compat_display_set_client_target(hwc2_disp, 0, buf, -1, 0);
+    /* Mirror wlroots' hwcomposer2 backend EXACTLY (it drives this same panel
+     * flicker-free under stock phosh): the layer stays CLIENT composition with
+     * NO buffer -- the client target alone carries the frame -- and frames where
+     * the composer demands composition-type changes are NOT presented. We used
+     * to accept_changes and present anyway; the composer then device-composited
+     * our bufferless layer and the glass got a BLACK frame -> rapid black
+     * flashes on every burst of presents (motion), occasionally a whole blank
+     * session. Skipping those frames just re-shows the previous good frame. */
+    if (vr != 0 /*HWC2_ERROR_NONE*/ && vr != 5 /*HWC2_ERROR_HAS_CHANGES*/) {
+        dtracef("present_cb #%lu validate failed %d\n", pn, vr);
+        return;
+    }
+    /* MTK HAL quirk: the composition-type-change demand can arrive with
+     * vr=NONE and nt>0 (not HAS_CHANGES). Accept WHENEVER types are pending --
+     * leaving the demand unaccepted puts the composer in a mismatched state and
+     * presents intermittently reach the glass as BLACK (the flicker/blank
+     * lottery). Always present afterwards; skipping frames is worse here. */
+    if (nt)
+        hwc2_compat_display_accept_changes(hwc2_disp);
+    /* Give each distinct window buffer a STABLE slot. The HAL caches buffers
+     * per slot; recycling slot 0 for all three cycling buffers thrashes the
+     * cache and (depending on per-boot HAL state) it sometimes latches a stale
+     * cached buffer -> black/old flashes on presents. SurfaceFlinger does the
+     * same per-buffer slot assignment. */
+    uint32_t slot = 0;
+    {
+        static struct ANativeWindowBuffer *slot_map[8];
+        static int slot_n = 0;
+        int found = -1;
+        for (int i = 0; i < slot_n; i++)
+            if (slot_map[i] == buf) { found = i; break; }
+        if (found < 0 && slot_n < 8) { slot_map[slot_n] = buf; found = slot_n++; }
+        if (found >= 0) slot = (uint32_t)found;
+    }
+    /* Keep the LAYER buffer set as well as the client target: if the composer
+     * negotiates the layer to DEVICE composition (per-session lottery, accepted
+     * above), it scans the LAYER buffer directly -- with no buffer there the
+     * glass stays permanently black while presents "succeed" (the blank-session
+     * state). With both set, whichever composition mode wins shows our frame. */
+    hwc2_compat_layer_set_buffer(hwc2_layer, slot, buf, -1);
+    hwc2_compat_display_set_client_target(hwc2_disp, slot, buf, -1, 0);
     int32_t fence = -1;
     int pr = hwc2_compat_display_present(hwc2_disp, &fence);
     dtracef("present_cb #%lu validate=%d nt=%u nr=%u present=%d fence=%d buf=%p\n",
             pn, vr, nt, nr, pr, fence, (void*)buf);
-    HWCNativeBufferSetFence(buf, -1);
     if (fence >= 0) close(fence);
 }
 
@@ -196,25 +323,40 @@ extern void *eglplatformcommon_wlr_lookup_anwb(buffer_handle_t handle);
 extern void *eglplatformcommon_wlr_make_anwb(buffer_handle_t handle);
 extern void *eglplatformcommon_wlr_display(void);
 
-/* HWC2 only scans out buffers that come from its own HWCNativeWindow queue (the
- * path mutter's eglSwapBuffers drives via present_cb). Presenting wlroots' raw
- * gbm_hybris buffer through set_client_target returns success but never reaches
- * the panel. So instead we run a tiny GLES2 blitter: import wlroots' rendered
- * buffer as a texture and draw it into an HWCNativeWindow surface, then
- * eglSwapBuffers -> present_cb -> HWC2. The window's buffer is HWC2-scanout
- * compatible, so this actually lights up the display. */
+/* Present path: render the committed wlroots buffer into OUR OWN linear
+ * gralloc buffers via FBO, and hand those to HWC2 directly (validate/accept/
+ * set-layer-buffer/set-client-target/present) -- the exact flow a CPU-written
+ * test buffer was PROVEN to display. The previous HWCNativeWindow/EGL-swapchain
+ * path was subject to a per-allocation lottery (buffers whose GL writes never
+ * reached the glass: black flashes under motion / blank sessions). No window,
+ * no swapchain, no lottery. */
 #ifndef EGL_NATIVE_BUFFER_ANDROID
 #define EGL_NATIVE_BUFFER_ANDROID 0x3140
 #endif
+#define BL_NBUF 3
 static EGLDisplay   bl_dpy  = EGL_NO_DISPLAY;
 static EGLContext   bl_ctx  = EGL_NO_CONTEXT;
-static EGLSurface   bl_surf = EGL_NO_SURFACE;
-static struct ANativeWindow *bl_win = NULL;
-static GLuint       bl_prog = 0, bl_tex = 0, bl_pos = 0;
+static EGLSurface   bl_surf = EGL_NO_SURFACE;  /* 1x1 pbuffer, makecurrent target only */
+static GLuint       bl_prog = 0, bl_pos = 0;
 static int          bl_ready = 0, bl_failed = 0;
 static PFNEGLCREATEIMAGEKHRPROC  p_eglCreateImageKHR;
 static PFNEGLDESTROYIMAGEKHRPROC p_eglDestroyImageKHR;
 static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC p_glEGLImageTargetTexture2DOES;
+
+static void bl_nb_incref(struct android_native_base_t *b) { (void)b; }
+static void bl_nb_decref(struct android_native_base_t *b) { (void)b; }
+
+/* Our presentation buffers: linear gralloc allocations wrapped as
+ * ANativeWindowBuffers, each with an EGLImage-backed FBO to render into. */
+static struct {
+    buffer_handle_t handle;
+    uint32_t stride;
+    ANativeWindowBuffer anwb;
+    EGLImageKHR img;
+    GLuint tex, fbo;
+} bl_buf[BL_NBUF];
+static int bl_cur = 0;
+static int bl_last_present_fence = -1;
 
 static GLuint bl_shader(GLenum type, const char *src) {
     GLuint s = glCreateShader(type);
@@ -223,6 +365,51 @@ static GLuint bl_shader(GLenum type, const char *src) {
     GLint ok = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
     if (!ok) { char log[512]; glGetShaderInfoLog(s, sizeof log, NULL, log); LOG("blit shader err: %s", log); }
     return s;
+}
+
+/* Allocate + import one presentation buffer; returns 0 on failure. */
+static int bl_buf_init(int i) {
+    /* usage 0x1b33: HW_FB|HW_COMPOSER|HW_RENDER|SW_READ_OFTEN|SW_WRITE_OFTEN --
+     * the exact combination proven to present correctly (CPU gray test). */
+    const uint64_t usage = 0x1000 | 0x800 | 0x200 | 0x33;
+    if (hybris_gralloc_allocate(frame_w, frame_h, 1 /*RGBA_8888*/, usage,
+                                &bl_buf[i].handle, &bl_buf[i].stride) != 0 || !bl_buf[i].handle) {
+        fprintf(stderr, "drmadapter: present buffer %d: gralloc allocate failed\n", i);
+        return 0;
+    }
+    ANativeWindowBuffer *nb = &bl_buf[i].anwb;
+    memset(nb, 0, sizeof *nb);
+    nb->common.magic   = ANDROID_NATIVE_BUFFER_MAGIC;
+    nb->common.version = sizeof(ANativeWindowBuffer);
+    nb->common.incRef  = bl_nb_incref;
+    nb->common.decRef  = bl_nb_decref;
+    nb->width  = frame_w;
+    nb->height = frame_h;
+    nb->stride = bl_buf[i].stride;
+    nb->format = 1;
+    nb->usage  = usage;
+    nb->handle = bl_buf[i].handle;
+
+    bl_buf[i].img = p_eglCreateImageKHR(bl_dpy, EGL_NO_CONTEXT,
+        EGL_NATIVE_BUFFER_ANDROID, (EGLClientBuffer)nb, NULL);
+    if (bl_buf[i].img == EGL_NO_IMAGE_KHR) {
+        fprintf(stderr, "drmadapter: present buffer %d: eglCreateImageKHR failed 0x%x\n", i, eglGetError());
+        return 0;
+    }
+    glGenTextures(1, &bl_buf[i].tex);
+    glBindTexture(GL_TEXTURE_2D, bl_buf[i].tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    p_glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)bl_buf[i].img);
+    glGenFramebuffers(1, &bl_buf[i].fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, bl_buf[i].fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, bl_buf[i].tex, 0);
+    GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (st != GL_FRAMEBUFFER_COMPLETE) {
+        fprintf(stderr, "drmadapter: present buffer %d: FBO incomplete 0x%x\n", i, st);
+        return 0;
+    }
+    return 1;
 }
 
 static int blit_init(void) {
@@ -237,34 +424,36 @@ static int blit_init(void) {
     LOG("blit: using wlr EGLDisplay %p", (void*)bl_dpy);
 
     EGLint cfgattr[] = {
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
         EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
         EGL_NONE
     };
     EGLConfig cfg; EGLint n = 0;
-    if (!eglChooseConfig(bl_dpy, cfgattr, &cfg, 1, &n) || n < 1) { LOG("blit: no EGL config"); bl_failed = 1; return 0; }
-
-    bl_win = HWCNativeWindowCreate(frame_w, frame_h, HAL_PIXEL_FORMAT_RGBA_8888, present_cb, NULL);
-    if (!bl_win) { LOG("blit: HWCNativeWindowCreate failed"); bl_failed = 1; return 0; }
-    bl_surf = eglCreateWindowSurface(bl_dpy, cfg, (EGLNativeWindowType)bl_win, NULL);
-    if (bl_surf == EGL_NO_SURFACE) { LOG("blit: eglCreateWindowSurface failed 0x%x", eglGetError()); bl_failed = 1; return 0; }
+    if (!eglChooseConfig(bl_dpy, cfgattr, &cfg, 1, &n) || n < 1) {
+        LOG("blit: no pbuffer EGL config"); bl_failed = 1; return 0;
+    }
+    EGLint pba[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+    bl_surf = eglCreatePbufferSurface(bl_dpy, cfg, pba);
+    if (bl_surf == EGL_NO_SURFACE) { LOG("blit: pbuffer failed 0x%x", eglGetError()); bl_failed = 1; return 0; }
     EGLint ctxattr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
     bl_ctx = eglCreateContext(bl_dpy, cfg, EGL_NO_CONTEXT, ctxattr);
-    if (bl_ctx == EGL_NO_CONTEXT) { LOG("blit: eglCreateContext failed 0x%x", eglGetError()); bl_failed = 1; return 0; }
+    if (bl_ctx == EGL_NO_CONTEXT) { LOG("blit: context failed 0x%x", eglGetError()); bl_failed = 1; return 0; }
 
     p_eglCreateImageKHR  = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
     p_eglDestroyImageKHR = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
     p_glEGLImageTargetTexture2DOES = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
-    if (!p_eglCreateImageKHR || !p_glEGLImageTargetTexture2DOES) { LOG("blit: missing EGL image procs"); bl_failed = 1; return 0; }
+    if (!p_eglCreateImageKHR || !p_glEGLImageTargetTexture2DOES) { LOG("blit: missing procs"); bl_failed = 1; return 0; }
 
     EGLContext sc = eglGetCurrentContext();
     EGLSurface sd = eglGetCurrentSurface(EGL_DRAW), sr = eglGetCurrentSurface(EGL_READ);
-    eglMakeCurrent(bl_dpy, bl_surf, bl_surf, bl_ctx);
+    if (!eglMakeCurrent(bl_dpy, bl_surf, bl_surf, bl_ctx)) {
+        LOG("blit: makecurrent failed 0x%x", eglGetError()); bl_failed = 1; return 0;
+    }
 
     static const char *vs =
         "attribute vec2 pos;\nvarying vec2 uv;\n"
-        "void main(){ uv = vec2((pos.x+1.0)*0.5, (1.0-pos.y)*0.5); gl_Position = vec4(pos,0.0,1.0); }\n";
+        "void main(){ uv = vec2((pos.x+1.0)*0.5, (pos.y+1.0)*0.5); gl_Position = vec4(pos,0.0,1.0); }\n";
     static const char *fs =
         "precision mediump float;\nvarying vec2 uv;\nuniform sampler2D tex;\n"
         "void main(){ gl_FragColor = texture2D(tex, uv); }\n";
@@ -274,39 +463,67 @@ static int blit_init(void) {
     glBindAttribLocation(bl_prog, 0, "pos");
     glLinkProgram(bl_prog);
     bl_pos = 0;
-    glGenTextures(1, &bl_tex);
-    glBindTexture(GL_TEXTURE_2D, bl_tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    /* Restore whatever was current (often nothing -- wlroots unbinds after
-     * rendering). Use bl_dpy, not eglGetCurrentDisplay(), which is nil here. */
+    for (int i = 0; i < BL_NBUF; i++) {
+        if (!bl_buf_init(i)) {
+            eglMakeCurrent(bl_dpy, sd, sr, sc);
+            bl_failed = 1; return 0;
+        }
+    }
+
+    /* End-to-end validation: GPU-clear each buffer to a known value and verify
+     * BOTH through GL readback and through the CPU (gralloc lock). The CPU view
+     * is what the display controller scans, so this catches any buffer whose
+     * GPU writes don't land in memory. */
+    for (int i = 0; i < BL_NBUF; i++) {
+        glBindFramebuffer(GL_FRAMEBUFFER, bl_buf[i].fbo);
+        glViewport(0, 0, frame_w, frame_h);
+        glClearColor(32.0f/255.0f, 32.0f/255.0f, 32.0f/255.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glFinish();
+        unsigned char px[4] = {0};
+        glReadPixels(frame_w/2, frame_h/2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        int gl_ok = (px[0] >= 24 && px[0] <= 40);
+        int cpu_ok = 0;
+        void *va = NULL;
+        if (hybris_gralloc_lock(bl_buf[i].handle, 0x3, 0, 0, frame_w, frame_h, &va) == 0 && va) {
+            unsigned char *p2 = (unsigned char*)va +
+                (size_t)(frame_h/2) * bl_buf[i].stride * 4 + (size_t)(frame_w/2) * 4;
+            cpu_ok = (p2[0] >= 24 && p2[0] <= 40);
+            hybris_gralloc_unlock(bl_buf[i].handle);
+        }
+        fprintf(stderr, "drmadapter: present buffer %d validation: GL=%s CPU=%s\n",
+                i, gl_ok ? "ok" : "FAIL", cpu_ok ? "ok" : "FAIL");
+        if (!gl_ok || !cpu_ok) {
+            fprintf(stderr, "drmadapter: present buffer %d NOT scan-safe; presents disabled\n", i);
+            eglMakeCurrent(bl_dpy, sd, sr, sc);
+            bl_failed = 1; return 0;
+        }
+    }
+
     eglMakeCurrent(bl_dpy, sd, sr, sc);
     bl_ready = 1;
-    LOG("blit: initialised (%dx%d)", frame_w, frame_h);
+    LOG("blit: initialised (%dx%d, %d linear present buffers)", frame_w, frame_h, BL_NBUF);
     return 1;
 }
 
 /* Per-handle cache of the imported EGLImage + GL texture for the blit source.
- * The EGLImage references the gralloc buffer's live memory, so one import per
- * buffer suffices -- sampling it each frame shows whatever wlroots last drew.
- * A fresh RemoteWindowBuffer (not wlroots' own) is imported because Mali rejects
- * a second eglCreateImageKHR on an already-imported ANativeWindowBuffer. Must be
- * called with the blit context current. */
+ * Mali allows only ONE import per underlying buffer (a second eglCreateImageKHR
+ * fails EGL_BAD_PARAMETER), so the image is imported once and re-bound to the
+ * texture each frame (the rebind refreshes the texture's view of the live
+ * buffer memory). Must be called with the blit context current. */
 #define BLIT_CACHE_MAX 8
+/* Per-source-handle cache of the imported EGLImage + texture. The image is
+ * imported once (Mali allows one live import per buffer) and re-targeted to the
+ * texture each frame to refresh its view of the live buffer memory. */
 static struct { buffer_handle_t handle; EGLImageKHR img; GLuint tex; } bl_cache[BLIT_CACHE_MAX];
 static int bl_cache_n = 0;
 static GLuint blit_tex_for_handle(buffer_handle_t handle) {
     for (int i = 0; i < bl_cache_n; i++)
         if (bl_cache[i].handle == handle) {
-            /* Re-associate the EGLImage with the texture every frame: the image
-             * references the gralloc buffer's live memory, but the GL texture
-             * cache can hold a stale snapshot, so without re-binding the blit
-             * shows an old frame -> flicker. This is cheap (no re-import). */
             glBindTexture(GL_TEXTURE_2D, bl_cache[i].tex);
             p_glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)bl_cache[i].img);
+            (void)glGetError();
             return bl_cache[i].tex;
         }
     if (bl_cache_n >= BLIT_CACHE_MAX) return 0;
@@ -315,10 +532,7 @@ static GLuint blit_tex_for_handle(buffer_handle_t handle) {
     if (!anwb) return 0;
     EGLImageKHR img = p_eglCreateImageKHR(bl_dpy, EGL_NO_CONTEXT,
         EGL_NATIVE_BUFFER_ANDROID, (EGLClientBuffer)anwb, NULL);
-    if (img == EGL_NO_IMAGE_KHR) {
-        LOG("blit: eglCreateImageKHR(fresh anwb) failed 0x%x", eglGetError());
-        return 0;
-    }
+    if (img == EGL_NO_IMAGE_KHR) return 0;
     GLuint tex = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
@@ -331,50 +545,96 @@ static GLuint blit_tex_for_handle(buffer_handle_t handle) {
     bl_cache[bl_cache_n].img = img;
     bl_cache[bl_cache_n].tex = tex;
     bl_cache_n++;
-    LOG("blit: cached image+texture for handle %p (tex %u)", (void*)handle, tex);
     return tex;
 }
 
 static int drmadapter_present_gralloc(buffer_handle_t handle) {
     if (!hwc2_ready || !hwc2_disp || !hwc2_layer || frame_w <= 0) return -1;
-    struct ANativeWindowBuffer *src =
-        (struct ANativeWindowBuffer *)eglplatformcommon_wlr_lookup_anwb(handle);
-    if (!src) return -1;
+    if (!handle) return -1;
     if (!blit_init()) return -1;
 
+    /* Pace to the display: wait for the PREVIOUS present's fence before
+     * rendering/presenting the next frame. Without this we cycle the 3 present
+     * buffers faster than the composer latches and re-render into a buffer it
+     * is still scanning -> out-of-order frames (jitter/tearing under motion). */
+    if (bl_last_present_fence >= 0) {
+        struct pollfd pf = { .fd = bl_last_present_fence, .events = POLLIN };
+        poll(&pf, 1, 100);
+        close(bl_last_present_fence);
+        bl_last_present_fence = -1;
+    }
+
     /* Save wlroots' current EGL state (frequently nothing -- it unbinds after
-     * rendering), switch to the blitter, draw, swap. Restore via bl_dpy. */
+     * rendering), switch to the blitter, render, present. Restore via bl_dpy. */
     EGLContext sc = eglGetCurrentContext();
     EGLSurface sd = eglGetCurrentSurface(EGL_DRAW), sr = eglGetCurrentSurface(EGL_READ);
-
-    /* GPU sync is handled upstream now: libdrm-hybris reports DRM_CAP_SYNCOBJ_
-     * TIMELINE unsupported so wlroots uses implicit fencing on the buffer, which
-     * Mali honours when the blit samples it. (Making wlroots' own context
-     * current here to glFinish corrupted its rendering -> black, so we don't.) */
     if (!eglMakeCurrent(bl_dpy, bl_surf, bl_surf, bl_ctx)) {
         static int w = 0; if (!w) { LOG("blit: makecurrent failed 0x%x", eglGetError()); w = 1; }
         return -1;
     }
 
     GLuint tex = blit_tex_for_handle(handle);
-    if (tex) {
-        glViewport(0, 0, frame_w, frame_h);
-        glUseProgram(bl_prog);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, tex);
-        glUniform1i(glGetUniformLocation(bl_prog, "tex"), 0);
-        static const GLfloat quad[] = { -1,-1, 1,-1, -1,1, 1,1 };
-        glEnableVertexAttribArray(bl_pos);
-        glVertexAttribPointer(bl_pos, 2, GL_FLOAT, GL_FALSE, 0, quad);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        glDisableVertexAttribArray(bl_pos);
-        eglSwapBuffers(bl_dpy, bl_surf); /* -> present_cb -> HWC2 */
+    if (tex == 0) {
+        static unsigned long z = 0;
+        if ((z++ % 300) == 0)
+            fprintf(stderr, "drmadapter: BLIT FAILED (no source tex) #%lu handle=%p\n", z, (void*)handle);
+        eglMakeCurrent(bl_dpy, sd, sr, sc);
+        return -1;
     }
 
-    eglMakeCurrent(bl_dpy, sd, sr, sc); /* restore wlroots state (sd/sc may be none) */
+    int i = bl_cur;
+    bl_cur = (bl_cur + 1) % BL_NBUF;
+    glBindFramebuffer(GL_FRAMEBUFFER, bl_buf[i].fbo);
+    glViewport(0, 0, frame_w, frame_h);
+    glUseProgram(bl_prog);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glUniform1i(glGetUniformLocation(bl_prog, "tex"), 0);
+    static const GLfloat quad[] = { -1,-1, 1,-1, -1,1, 1,1 };
+    glEnableVertexAttribArray(bl_pos);
+    glVertexAttribPointer(bl_pos, 2, GL_FLOAT, GL_FALSE, 0, quad);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisableVertexAttribArray(bl_pos);
+    /* Ensure the render fully lands in the (linear) buffer memory before the
+     * composer scans it: glFinish completes the GPU work. */
+    glFinish();
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    eglMakeCurrent(bl_dpy, sd, sr, sc); /* restore wlroots state early */
+
+    /* Present: the exact flow proven by the CPU-written gray test. */
+    uint32_t nt = 0, nr = 0;
+    int vr = hwc2_compat_display_validate(hwc2_disp, &nt, &nr);
+    if (vr != 0 && vr != 5) {
+        dtracef("present validate failed %d\n", vr);
+        return -1;
+    }
+    if (nt)
+        hwc2_compat_display_accept_changes(hwc2_disp);
+    /* Per-buffer slots: the HAL caches buffers per slot; rotating three
+     * different buffers through one slot made the cache serve STALE entries ->
+     * older frames interleaved on the glass (ghosting/trailing under motion).
+     * One slot per buffer keeps the cache always correct. */
+    hwc2_compat_layer_set_buffer(hwc2_layer, (uint32_t)i, &bl_buf[i].anwb, -1);
+    hwc2_compat_display_set_client_target(hwc2_disp, (uint32_t)i, &bl_buf[i].anwb, -1, 0);
+    int32_t fence = -1;
+    int pr = hwc2_compat_display_present(hwc2_disp, &fence);
+    /* Keep the fence: the next present waits on it (pacing), then closes it. */
+    bl_last_present_fence = fence;
+
     static unsigned long pn = 0;
-    if ((pn++ % 120) == 0)
-        dtracef("present_gralloc(blit) #%lu handle=%p tex=%u\n", pn, (void*)handle, tex);
+    pn++;
+    if (pn <= 12)
+        fprintf(stderr, "drmadapter: PRESENT #%lu buf=%d vr=%d nt=%u pr=%d\n", pn, i, vr, nt, pr);
+    /* Liveness heartbeat for the session watchdog (cheap; off unless env set). */
+    {
+        static int hb = -2; static const char *hbp;
+        if (hb == -2) { hbp = getenv("DRMADAPTER_HEARTBEAT"); hb = hbp ? 1 : 0; }
+        static unsigned long okn = 0;
+        if (hb && ((okn++ % 3) == 0)) {
+            FILE *f = fopen(hbp, "w");
+            if (f) { fprintf(f, "%lu\n", okn); fclose(f); }
+        }
+    }
     return 0;
 }
 

@@ -1,5 +1,5 @@
 [Unit]
-Description=phosh 0.55 on the wlroots DRM backend (hybris/HWC2 shims)
+Description=phosh (FuriLabs stack) on the wlroots DRM backend (hybris/HWC2 shims)
 # Take over the role phosh had: replace the getty, fall back to stock phosh if
 # the DRM shell cannot come up.
 Conflicts=getty@tty1.service phosh.service
@@ -13,7 +13,6 @@ Wants=dbus.socket
 Before=graphical.target
 ConditionPathExists=/dev/tty0
 # If the DRM shell fails repeatedly, fall back to stock phosh (0.53).
-OnFailure=phosh.service
 StartLimitIntervalSec=120
 StartLimitBurst=3
 
@@ -30,18 +29,15 @@ Environment=XDG_SESSION_TYPE=wayland
 # XDG_SEAT, no XDG_VTNR. The PAM session stays Class=user with Seat=none, like
 # the proven manual launch.
 ExecStartPre=/bin/bash -c "WAITFORSERVICE_VALUE=1 waitforservice vendor.furios.hwcomposer.ready && sleep 3"
-ExecStart=/sbin/capsh --noamb -- -c "exec /usr/libexec/phosh-drm-session"
+ExecStart=/sbin/capsh --noamb -- -c "exec /usr/libexec/phoc-drm-session-furi"
 # Make VT7 the visible console (the composer scans out independent of the VT).
 ExecStartPost=+/usr/bin/chvt 7
 TimeoutStartSec=60
 User=32011
 PAMName=phosh-drm
 WorkingDirectory=~
-# Restart=no (not always): the launcher's render watchdog exits non-zero when
-# phosh never composites, and we want that to reach OnFailure=phosh.service
-# cleanly. Restart=always fights OnFailure (it re-queues a start), producing a
-# phosh-drm<->phosh flap. So let a failure fall straight through to stock phosh.
-Restart=no
+Restart=always
+RestartSec=5s
 # On stop, SIGTERM the WHOLE cgroup (default KillMode=control-group) so phoc
 # gets the signal directly and does its clean wlroots shutdown, RELEASING the
 # singleton HWC2 composer client. (KillMode=mixed signals only the launcher,

@@ -1,3 +1,39 @@
+diff --git a/backend/drm/drm.c b/backend/drm/drm.c
+index 07880c4..89410cb 100644
+--- a/backend/drm/drm.c
++++ b/backend/drm/drm.c
+@@ -1712,14 +1712,18 @@ static void handle_page_flip(int fd, unsigned seq,
+ 	drm_page_flip_destroy(page_flip);
+ 
+ 	if (conn == NULL) {
++		// drmadapter diag: completion discarded; the owning output's
++		// frame_pending may never clear -> visual freeze.
++		wlr_log(WLR_ERROR, "page-flip DISCARDED: orphaned page_flip (conn=NULL) crtc=%u seq=%u",
++			crtc_id, seq);
+ 		return;
+ 	}
+ 
+ 	struct wlr_drm_backend *drm = conn->backend;
+ 
+ 	if (conn->status != DRM_MODE_CONNECTED || conn->crtc == NULL) {
+-		wlr_drm_conn_log(conn, WLR_DEBUG,
+-			"Ignoring page-flip event for disabled connector");
++		wlr_log(WLR_ERROR, "page-flip DISCARDED for '%s': status=%d crtc=%p",
++			conn->name, conn->status, (void *)conn->crtc);
+ 		return;
+ 	}
+ 
+@@ -1765,6 +1769,10 @@ static void handle_page_flip(int fd, unsigned seq,
+ 
+ 	if (drm->session->active) {
+ 		wlr_output_send_frame(&conn->output);
++	} else {
++		// drmadapter diag: frame event skipped -> frame_pending never clears.
++		wlr_log(WLR_ERROR, "page-flip: frame event SKIPPED (session inactive) for '%s'",
++			conn->name);
+ 	}
+ }
+ 
 diff --git a/backend/hwcomposer/output.c b/backend/hwcomposer/output.c
 index a4c8a00..484bfb3 100644
 --- a/backend/hwcomposer/output.c
@@ -35,10 +71,16 @@ index e2bfa55..2447da6 100644
  	return false;
  }
 diff --git a/render/gles2/pass.c b/render/gles2/pass.c
-index 768e81d..5dab5b7 100644
+index 768e81d..a08fa05 100644
 --- a/render/gles2/pass.c
 +++ b/render/gles2/pass.c
-@@ -36,7 +36,12 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
+@@ -1,4 +1,5 @@
+ #define _POSIX_C_SOURCE 199309L
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <assert.h>
+ #include <pixman.h>
+@@ -36,7 +37,12 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
  		clock_gettime(CLOCK_MONOTONIC, &timer->cpu_end);
  	}
  
@@ -52,3 +94,155 @@ index 768e81d..5dab5b7 100644
  	glBindFramebuffer(GL_FRAMEBUFFER, 0);
  
  	pop_gles2_debug(renderer);
+diff --git a/render/gles2/renderer.c b/render/gles2/renderer.c
+index c047cec..ec114c4 100644
+--- a/render/gles2/renderer.c
++++ b/render/gles2/renderer.c
+@@ -255,7 +255,12 @@ static bool gles2_begin(struct wlr_renderer *wlr_renderer, uint32_t width,
+ 
+ static void gles2_end(struct wlr_renderer *wlr_renderer) {
+ 	gles2_get_renderer_in_context(wlr_renderer);
+-	// no-op
++	/* drmadapter faked-KMS: block until the render completes -- the faked commit
++	 * skips the kernel's implicit-fence wait, so the blitter would otherwise
++	 * sample a still-rendering buffer (flicker). This is the REAL submit path for
++	 * phoc's output render (legacy pass -> wlr_renderer_end); the render-pass
++	 * submit in pass.c is not used by phoc 0.44. */
++	glFinish();
+ }
+ 
+ static void gles2_clear(struct wlr_renderer *wlr_renderer,
+diff --git a/render/gles2/texture.c b/render/gles2/texture.c
+index ca88623..a7e4e33 100644
+--- a/render/gles2/texture.c
++++ b/render/gles2/texture.c
+@@ -9,6 +9,7 @@
+ #include <wlr/render/egl.h>
+ #include <wlr/render/interface.h>
+ #include <wlr/render/wlr_texture.h>
++#include <wlr/types/wlr_android_wlegl.h>
+ #include <wlr/types/wlr_matrix.h>
+ #include <wlr/util/log.h>
+ #include "render/egl.h"
+@@ -111,10 +112,12 @@ static bool gles2_texture_invalidate(struct wlr_gles2_texture *texture) {
+ 	if (texture->image == EGL_NO_IMAGE_KHR) {
+ 		return false;
+ 	}
+-	if (texture->target == GL_TEXTURE_EXTERNAL_OES) {
+-		// External changes are immediately made visible by the GL implementation
+-		return true;
+-	}
++	// NB: upstream early-returns for GL_TEXTURE_EXTERNAL_OES ("external changes
++	// are immediately made visible by the GL implementation"), but the hybris/
++	// Mali driver does NOT reflect new gralloc content into an already-bound
++	// external texture -- it needs the image re-targeted each reuse or it samples
++	// a stale frame (shows the app's first/blank buffer -> black). So fall through
++	// and re-bind for external textures too.
+ 
+ 	struct wlr_egl_context prev_ctx;
+ 	wlr_egl_save_context(&prev_ctx);
+@@ -349,10 +352,104 @@ static struct wlr_texture *gles2_texture_from_dmabuf_buffer(
+ 	return &texture->wlr_texture;
+ }
+ 
++// Import an android_wlegl (hybris client EGL) buffer as a GL_TEXTURE_EXTERNAL_OES
++// texture. The buffer carries a full ANativeWindowBuffer (imported gralloc
++// handle), which the Android EGL imports directly via EGL_NATIVE_BUFFER_ANDROID
++// -- the same path the drmadapter scanout blitter uses. This lets the plain
++// gles2 renderer composite hybris clients on the DRM backend, without the full
++// android renderer (whose per-output EGLSurface model doesn't fit DRM/GBM).
++static struct wlr_texture *android_wlegl_texture_create(
++		struct wlr_gles2_renderer *renderer, struct wlr_android_wlegl_buffer *buffer) {
++	if (!renderer->procs.glEGLImageTargetTexture2DOES ||
++			!renderer->egl->procs.eglCreateImageKHR) {
++		return NULL;
++	}
++	if (buffer->inner.native_buffer == NULL) {
++		return NULL;
++	}
++
++	struct wlr_gles2_texture *texture =
++		gles2_texture_create(renderer, buffer->base.width, buffer->base.height);
++	if (texture == NULL) {
++		return NULL;
++	}
++	texture->drm_format = DRM_FORMAT_INVALID; // sampled only
++	texture->has_alpha = true;
++	texture->target = GL_TEXTURE_EXTERNAL_OES;
++
++	struct wlr_egl_context prev_ctx;
++	wlr_egl_save_context(&prev_ctx);
++	wlr_egl_make_current(renderer->egl);
++
++	struct ANativeWindowBuffer *anwb = &buffer->inner.native_buffer->base;
++	texture->image = renderer->egl->procs.eglCreateImageKHR(renderer->egl->display,
++		EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, (EGLClientBuffer)anwb, NULL);
++	if (texture->image == EGL_NO_IMAGE_KHR) {
++		wlr_log(WLR_ERROR, "Failed to create EGL image from android_wlegl buffer");
++		wlr_egl_restore_context(&prev_ctx);
++		wl_list_remove(&texture->link);
++		free(texture);
++		return NULL;
++	}
++
++	push_gles2_debug(renderer);
++	glGenTextures(1, &texture->tex);
++	glBindTexture(GL_TEXTURE_EXTERNAL_OES, texture->tex);
++	glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++	glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++	renderer->procs.glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, texture->image);
++	glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
++	pop_gles2_debug(renderer);
++
++	wlr_egl_restore_context(&prev_ctx);
++	return &texture->wlr_texture;
++}
++
++static struct wlr_texture *gles2_texture_from_android_wlegl(
++		struct wlr_renderer *wlr_renderer, struct wlr_buffer *wlr_buffer) {
++	struct wlr_gles2_renderer *renderer = gles2_get_renderer(wlr_renderer);
++	struct wlr_android_wlegl_buffer *buffer =
++		(struct wlr_android_wlegl_buffer *)wlr_buffer;
++
++	// Like the dmabuf path: cache the texture on the buffer and hold a lock on
++	// it, so wlroots won't send wl_buffer.release (letting the client re-render
++	// into it) while our EXTERNAL_OES texture still samples that gralloc memory.
++	// Without this the client reuses the buffer mid-composite -> flicker.
++	struct wlr_addon *addon =
++		wlr_addon_find(&wlr_buffer->addons, renderer, &texture_addon_impl);
++	if (addon != NULL) {
++		struct wlr_gles2_texture *texture =
++			wl_container_of(addon, texture, buffer_addon);
++		// Re-target the EGL image so we sample the client's current content, not
++		// the stale frame this cached texture last held (see gles2_texture_invalidate).
++		if (!gles2_texture_invalidate(texture)) {
++			return NULL;
++		}
++		wlr_buffer_lock(texture->buffer);
++		return &texture->wlr_texture;
++	}
++
++	struct wlr_texture *wlr_texture = android_wlegl_texture_create(renderer, buffer);
++	if (wlr_texture == NULL) {
++		return NULL;
++	}
++
++	struct wlr_gles2_texture *texture = gles2_get_texture(wlr_texture);
++	texture->buffer = wlr_buffer_lock(wlr_buffer);
++	wlr_addon_init(&texture->buffer_addon, &wlr_buffer->addons,
++		renderer, &texture_addon_impl);
++
++	return &texture->wlr_texture;
++}
++
+ struct wlr_texture *gles2_texture_from_buffer(struct wlr_renderer *wlr_renderer,
+ 		struct wlr_buffer *buffer) {
+ 	struct wlr_gles2_renderer *renderer = gles2_get_renderer(wlr_renderer);
+ 
++	if (wlr_android_wlegl_buffer_is_instance(buffer)) {
++		return gles2_texture_from_android_wlegl(wlr_renderer, buffer);
++	}
++
+ 	void *data;
+ 	uint32_t format;
+ 	size_t stride;

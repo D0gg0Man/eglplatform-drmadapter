@@ -1,8 +1,16 @@
 diff --git a/src/desktop.c b/src/desktop.c
-index 785fb05..0200e57 100644
+index 785fb05..be0b8f4 100644
 --- a/src/desktop.c
 +++ b/src/desktop.c
-@@ -1210,6 +1210,11 @@ phoc_desktop_notify_activity (PhocDesktop *self, PhocSeat *seat)
+@@ -16,6 +16,7 @@
+ #include <wlr/types/wlr_gamma_control_v1.h>
+ #include <wlr/types/wlr_idle_notify_v1.h>
+ #include <wlr/types/wlr_layer_shell_v1.h>
++#include <dlfcn.h>
+ #include <wlr/types/wlr_output_layout.h>
+ #include <wlr/types/wlr_output_power_management_v1.h>
+ #include <wlr/types/wlr_pointer_constraints_v1.h>
+@@ -1210,6 +1211,11 @@ phoc_desktop_notify_activity (PhocDesktop *self, PhocSeat *seat)
    priv = phoc_desktop_get_instance_private (self);
  
    wlr_idle_notifier_v1_notify_activity (priv->idle_notifier_v1, seat->seat);
@@ -15,7 +23,7 @@ index 785fb05..0200e57 100644
  
  gboolean
 diff --git a/src/output.c b/src/output.c
-index d54bac2..f8dc6a0 100644
+index d54bac2..9bac85e 100644
 --- a/src/output.c
 +++ b/src/output.c
 @@ -14,6 +14,7 @@
@@ -26,7 +34,114 @@ index d54bac2..f8dc6a0 100644
  #include <wlr/types/wlr_output_power_management_v1.h>
  #include <wlr/types/wlr_matrix.h>
  #include <wlr/types/wlr_xdg_shell.h>
-@@ -1743,6 +1744,56 @@ phoc_handle_output_manager_test (struct wl_listener *listener, void *data)
+@@ -386,6 +387,21 @@ scan_out_fullscreen_view (PhocOutput *self, PhocView *view, struct wlr_output_st
+ 
+   g_assert (PHOC_IS_VIEW (view));
+ 
++  /* Direct scanout hands the client's own buffer straight to the commit,
++   * bypassing phoc's compositing render. On the drmadapter/hybris faked-KMS DRM
++   * path that buffer is then blitted to HWC2 without waiting for the client's
++   * render to finish (wlroots 0.17.4 has no explicit sync, and our commit is
++   * faked) -> it flickers (e.g. the fullscreen lockscreen). Force compositing,
++   * which is synced by the renderer's glFinish, when the drmadapter shim is
++   * loaded. */
++  {
++    static int drm = -1;
++    if (drm < 0)
++      drm = dlsym (RTLD_DEFAULT, "drm_shim_panel_is_on") ? 1 : 0;
++    if (drm)
++      return false;
++  }
++
+   for (GSList *elem = phoc_input_get_seats (input); elem; elem = elem->next) {
+     PhocSeat *seat = PHOC_SEAT (elem->data);
+     PhocDragIcon *drag_icon;
+@@ -512,6 +528,19 @@ phoc_output_draw (PhocOutput *self)
+   if (wlr_renderer_is_android(wlr_output->renderer))
+     buffer_age = wlr_renderer_get_buffer_age (wlr_output->renderer, buffer);
+ 
++  /* drmadapter faked-KMS: force full-frame redraws. With partial (buffer-age)
++   * damage the not-redrawn regions of the reused swapchain buffer hold pixels
++   * from TWO frames ago; on this path the age/reuse bookkeeping doesn't hold up
++   * and any motion alternates stale/new content (rapid flicker on movement,
++   * rock-solid when static). Age 0 = "unknown" = full damage. */
++  {
++    static int drm = -1;
++    if (drm < 0)
++      drm = dlsym (RTLD_DEFAULT, "drm_shim_panel_is_on") ? 1 : 0;
++    if (drm)
++      buffer_age = 0;
++  }
++
+   render_pass = wlr_renderer_begin_buffer_pass_for_output (wlr_output->renderer, buffer, NULL, (void*)wlr_output);
+   if (!render_pass) {
+     wlr_buffer_unlock (buffer);
+@@ -850,6 +879,36 @@ phoc_output_fill_state (PhocOutput              *self,
+ }
+ 
+ 
++/* See the registration site in phoc_output_initable_init () for why. */
++static gboolean
++phoc_output_frame_watchdog_cb (gpointer data)
++{
++  PhocOutput *self = PHOC_OUTPUT (data);
++
++  if (self->wlr_output == NULL)
++    return G_SOURCE_CONTINUE;
++
++  /* Stuck means: a commit is awaiting its flip completion AND no new commits
++   * are landing. During healthy continuous rendering frame_pending is true a
++   * lot of the time but commit_seq advances every frame -- don't fire then
++   * (a spurious frame event would double-drive the render loop). */
++  if (self->wlr_output->frame_pending &&
++      self->wlr_output->commit_seq == self->frame_watchdog_seq) {
++    if (++self->frame_stuck_count >= 2) {
++      g_message ("phoc: frame_pending stuck on %s (lost flip completion) — forcing frame event",
++                 self->wlr_output->name);
++      self->frame_stuck_count = 0;
++      wlr_output_send_frame (self->wlr_output);
++    }
++  } else {
++    self->frame_stuck_count = 0;
++  }
++  self->frame_watchdog_seq = self->wlr_output->commit_seq;
++
++  return G_SOURCE_CONTINUE;
++}
++
++
+ static gboolean
+ phoc_output_initable_init (GInitable    *initable,
+                            GCancellable *cancellable,
+@@ -901,6 +960,18 @@ phoc_output_initable_init (GInitable    *initable,
+   wl_signal_add (&self->desktop->output_power_manager_v1->events.set_mode,
+                  &self->output_power_manager_set_mode);
+ 
++  /* drmadapter faked-KMS only: watchdog against a stuck frame_pending. The
++   * synthetic page-flip completions are delivered by the shim, but wlroots can
++   * still discard one that lands mid output-state churn -- frame_pending then
++   * stays true forever, wlr_output_schedule_frame () no-ops, and the shell
++   * freezes visually (input keeps working) until a restart. A flip normally
++   * completes in <10ms, so frame_pending being set across two 300ms samples
++   * means the completion was lost: force the frame event to restart the loop. */
++  if (dlsym (RTLD_DEFAULT, "drm_shim_panel_is_on")) {
++    self->frame_stuck_count = 0;
++    self->frame_watchdog_id = g_timeout_add (300, phoc_output_frame_watchdog_cb, self);
++  }
++
+   PhocOutputConfig *output_config = phoc_config_get_output (config, self);
+   struct wlr_output_state pending;
+   phoc_output_fill_state (self, output_config, &pending);
+@@ -960,6 +1031,8 @@ phoc_output_finalize (GObject *object)
+   PhocOutput *self = PHOC_OUTPUT (object);
+   PhocOutputPrivate *priv = phoc_output_get_instance_private (self);
+ 
++  g_clear_handle_id (&self->frame_watchdog_id, g_source_remove);
++
+   self->wlr_output->data = NULL;
+   self->wlr_output = NULL;
+ 
+@@ -1743,6 +1816,74 @@ phoc_handle_output_manager_test (struct wl_listener *listener, void *data)
  }
  
  
@@ -74,16 +189,34 @@ index d54bac2..f8dc6a0 100644
 +  if (panel_is_on == NULL || panel_power == NULL || panel_is_on ())
 +    return;
 +
++  g_message ("phoc: waking panel on input activity");
 +  panel_power (1);
 +  phoc_output_send_power_mode (output, TRUE);
 +  phoc_output_damage_whole (output);
++  /* The synthetic flip clock idles while blanked; damage alone may not restart
++   * wlroots' frame scheduler on the faked-KMS path, so kick it explicitly so a
++   * frame actually gets presented (which is what lights the HWC2 panel). */
++  wlr_output_schedule_frame (output->wlr_output);
++
++  /* Clear phosh's blank: phosh drops PHOSH_STATE_BLANKED (and re-renders the
++   * lockscreen) only when the org.gnome.Mutter.DisplayConfig PowerSaveMode goes
++   * to 0. On this stack input activity never propagates to gnome-session's idle
++   * monitor, so gsd never resets it and phosh stays blanked (black) forever after
++   * a blank. Reset it here on the first input after a blank; the damage_whole
++   * above then bootstraps phosh's redraw via a frame callback. */
++  g_spawn_command_line_async ("gdbus call --session "
++                              "--dest org.gnome.Mutter.DisplayConfig "
++                              "--object-path /org/gnome/Mutter/DisplayConfig "
++                              "--method org.freedesktop.DBus.Properties.Set "
++                              "org.gnome.Mutter.DisplayConfig PowerSaveMode \"<int32 0>\"",
++                              NULL);
 +}
 +
 +
  void
  phoc_output_handle_output_power_manager_set_mode (struct wl_listener *listener, void *data)
  {
-@@ -1767,6 +1818,27 @@ phoc_output_handle_output_power_manager_set_mode (struct wl_listener *listener,
+@@ -1767,6 +1908,43 @@ phoc_output_handle_output_power_manager_set_mode (struct wl_listener *listener,
      return;
    }
  
@@ -100,10 +233,26 @@ index d54bac2..f8dc6a0 100644
 +      resolved = TRUE;
 +    }
 +    if (panel_power) {
++      /* On the faked-KMS/hybris (drmadapter) path EVERY compositor-side blank
++       * wedges wlroots' frame loop: disabling the wlr_output tears down the mode
++       * (modeset-on-reenable freeze); even keeping it enabled and only toggling
++       * HWC2 power stalls the synthetic-flip/frame-callback loop so the shell
++       * freezes and never resumes. So the compositor does NOT participate in DPMS
++       * at all -- it stays rendering. phosh's own brightness manager still dims
++       * the backlight on idle (that path works and doesn't freeze), which is the
++       * effective "blank"; any touch/key then wakes because the compositor never
++       * stopped. We DO still confirm the requested mode so phosh's output-power
++       * state stays consistent, but change nothing on the output. */
++      g_message ("phoc: output-power %s (drmadapter path)", enable ? "ON" : "OFF");
++      /* Drive the shim's panel power. Whether that actually toggles HWC2 power
++       * (real DPMS) or is a no-op is decided in drmadapter by DRMADAPTER_HWC2_DPMS
++       * -- with the eventfd flip-wake in place the HWC2 power cycle no longer
++       * wedges the frame clock, so real DPMS can be re-tested. The output stays
++       * enabled either way (no modeset). */
 +      panel_power (enable);
 +      phoc_output_send_power_mode (self, enable);
-+      if (enable)
-+        phoc_output_damage_whole (self);
++      phoc_output_damage_whole (self);
++      wlr_output_schedule_frame (self->wlr_output);
 +      return;
 +    }
 +  }
@@ -112,10 +261,22 @@ index d54bac2..f8dc6a0 100644
    if (enable == current)
      return;
 diff --git a/src/output.h b/src/output.h
-index 2897c5f..732c6c4 100644
+index 2897c5f..173e3c3 100644
 --- a/src/output.h
 +++ b/src/output.h
-@@ -133,6 +133,7 @@ void        phoc_output_handle_gamma_control_set_gamma (struct wl_listener *list
+@@ -60,6 +60,11 @@ struct _PhocOutput {
+   struct wl_listener        output_destroy;
+   struct wl_listener        output_power_manager_set_mode;
+ 
++  /* drmadapter faked-KMS: self-heal a stuck frame_pending (lost flip completion) */
++  guint                     frame_watchdog_id;
++  guint8                    frame_stuck_count;
++  guint32                   frame_watchdog_seq;
++
+   /* TODO: Should be private, move bits out of renderer */
+   struct wlr_damage_ring    damage_ring;
+ };
+@@ -133,6 +138,7 @@ void        phoc_output_handle_gamma_control_set_gamma (struct wl_listener *list
  struct wlr_output *
              phoc_output_get_wlr_output (PhocOutput *output);
  void        phoc_output_damage_whole (PhocOutput *output);
@@ -123,3 +284,32 @@ index 2897c5f..732c6c4 100644
  void        phoc_output_damage_from_view (PhocOutput *self, PhocView *view, bool whole);
  void        phoc_output_damage_whole_drag_icon (PhocOutput   *self,
                                                  PhocDragIcon *icon);
+diff --git a/src/server.c b/src/server.c
+index dc44f82..44ad749 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -25,6 +25,10 @@
+ 
+ #ifdef WLROOTS_HAS_ANDROID_RENDERER
+ #include <wlr/render/android.h>
++/* wlr_android_wlegl.h itself pulls in an internal generated protocol header
++ * that isn't installed, so just forward-declare the one entry point we need. */
++struct wlr_android_wlegl *wlr_android_wlegl_create (struct wl_display *display,
++                                                    struct wlr_renderer *renderer);
+ #endif /* WLROOTS_HAS_ANDROID_RENDERER */
+ 
+ #include <errno.h>
+@@ -307,6 +311,13 @@ phoc_server_initable_init (GInitable    *initable,
+ #ifdef WLROOTS_HAS_ANDROID_RENDERER
+   if (wlr_renderer_is_android (wlr_renderer)) {
+       wlr_android_renderer_init_wl_display (wlr_renderer, self->wl_display);
++  } else {
++      /* On the drmadapter/hybris DRM path we run the plain gles2 renderer, not
++       * the android renderer -- but hybris client apps still need the
++       * android_wlegl global to hand their gralloc buffers to the compositor.
++       * Advertise it here; the patched gles2 renderer imports the buffers via
++       * EGL_NATIVE_BUFFER_ANDROID. */
++      wlr_android_wlegl_create (self->wl_display, wlr_renderer);
+   }
+ #endif /* WLROOTS_HAS_ANDROID_RENDERER */
+ 
