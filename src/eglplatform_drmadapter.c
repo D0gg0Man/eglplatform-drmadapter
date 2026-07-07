@@ -108,6 +108,7 @@ out:
 }
 
 static int drmadapter_present_gralloc(buffer_handle_t handle);
+static int drmadapter_present_cpu(const void *src, uint32_t src_pitch);
 
 /* DPMS: libdrm-hybris calls this when wlroots toggles the CRTC ACTIVE state, so
  * we power the real panel down on blank and back up on wake (HWC2 power modes:
@@ -201,6 +202,13 @@ static void drmadapterws_init_module(struct ws_egl_interface *egl_iface) {
     if (set_present) {
         set_present(drmadapter_present_gralloc);
         LOG("registered drmadapter_present_gralloc with libdrm-hybris");
+    }
+    /* Single-pass CPU present for the QPainter (software) compositor path. */
+    void (*set_present_cpu)(int (*)(const void *, uint32_t)) =
+        (void (*)(int (*)(const void *, uint32_t)))dlsym(RTLD_DEFAULT, "drm_shim_set_present_cpu");
+    if (set_present_cpu) {
+        set_present_cpu(drmadapter_present_cpu);
+        LOG("registered drmadapter_present_cpu with libdrm-hybris");
     }
     /* Same for the DPMS power callback. */
     void (*set_power)(void (*)(int)) =
@@ -357,6 +365,9 @@ static struct {
 } bl_buf[BL_NBUF];
 static int bl_cur = 0;
 static int bl_last_present_fence = -1;
+/* Serializes HWC2 validate/set/present across threads: the QPainter present
+ * worker and the wlroots gralloc path may otherwise submit concurrently. */
+static pthread_mutex_t hwc2_present_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static GLuint bl_shader(GLenum type, const char *src) {
     GLuint s = glCreateShader(type);
@@ -643,14 +654,16 @@ static int drmadapter_present_gralloc(buffer_handle_t handle) {
                 hybris_gralloc_unlock(handle);
             }
             eglMakeCurrent(bl_dpy, sd, sr, sc);
+            pthread_mutex_lock(&hwc2_present_mu);
             uint32_t nt2 = 0, nr2 = 0;
             int vr2 = hwc2_compat_display_validate(hwc2_disp, &nt2, &nr2);
-            if (vr2 != 0 && vr2 != 5) return -1;
+            if (vr2 != 0 && vr2 != 5) { pthread_mutex_unlock(&hwc2_present_mu); return -1; }
             if (nt2) hwc2_compat_display_accept_changes(hwc2_disp);
             hwc2_compat_layer_set_buffer(hwc2_layer, (uint32_t)i2, &bl_buf[i2].anwb, -1);
             hwc2_compat_display_set_client_target(hwc2_disp, (uint32_t)i2, &bl_buf[i2].anwb, -1, 0);
             int32_t f2 = -1;
             hwc2_compat_display_present(hwc2_disp, &f2);
+            pthread_mutex_unlock(&hwc2_present_mu);
             if (f2 >= 0) close(f2);
             static int hb2 = -2; static const char *hbp2;
             if (hb2 == -2) { hbp2 = getenv("DRMADAPTER_HEARTBEAT"); hb2 = hbp2 ? 1 : 0; }
@@ -692,9 +705,11 @@ static int drmadapter_present_gralloc(buffer_handle_t handle) {
     eglMakeCurrent(bl_dpy, sd, sr, sc); /* restore wlroots state early */
 
     /* Present: the exact flow proven by the CPU-written gray test. */
+    pthread_mutex_lock(&hwc2_present_mu);
     uint32_t nt = 0, nr = 0;
     int vr = hwc2_compat_display_validate(hwc2_disp, &nt, &nr);
     if (vr != 0 && vr != 5) {
+        pthread_mutex_unlock(&hwc2_present_mu);
         dtracef("present validate failed %d\n", vr);
         return -1;
     }
@@ -708,6 +723,7 @@ static int drmadapter_present_gralloc(buffer_handle_t handle) {
     hwc2_compat_display_set_client_target(hwc2_disp, (uint32_t)i, &bl_buf[i].anwb, -1, 0);
     int32_t fence = -1;
     int pr = hwc2_compat_display_present(hwc2_disp, &fence);
+    pthread_mutex_unlock(&hwc2_present_mu);
     /* Keep the fence: the next present waits on it (pacing), then closes it. */
     bl_last_present_fence = fence;
 
@@ -725,6 +741,154 @@ static int drmadapter_present_gralloc(buffer_handle_t handle) {
             if (f) { fprintf(f, "%lu\n", okn); fclose(f); }
         }
     }
+    return 0;
+}
+
+/* Single-pass CPU present for the QPainter (software) compositor path:
+ * swizzle-copy the compositor's dumb-buffer CPU mapping straight into a
+ * present buffer and hand it to HWC2. Replaces the old dumb -> scratch
+ * gralloc -> present-buffer flow (two full-frame passes) with one. Pure CPU:
+ * no EGL context switch, no GL.
+ *
+ * The work runs on a dedicated worker thread: it costs ~4-5ms per fullscreen
+ * frame, and doing it inside the compositor's page-flip call pushed each
+ * frame past the vblank budget (hard 60fps ceiling, ~40fps in practice). The
+ * flip just queues {src,pitch}; the compositor double-buffers its dumb
+ * buffers, so the source stays stable until its NEXT flip -- the same
+ * contract real KMS scanout relies on. All HWC2 submission is serialized
+ * with hwc2_present_mu (the wlroots gralloc path can fire concurrently). */
+static int present_cpu_sync(const void *src, uint32_t src_pitch) {
+    static int prof = -1;
+    if (prof < 0) prof = getenv("DRMADAPTER_PROF") ? 1 : 0;
+    struct timespec t0, t1;
+    if (prof) clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    int i2 = bl_cur;
+    bl_cur = (bl_cur + 1) % BL_NBUF;
+    void *dv = NULL;
+    if (hybris_gralloc_lock(bl_buf[i2].handle, 0x30, 0, 0, frame_w, frame_h, &dv) != 0 || !dv)
+        return -1;
+    size_t dpitch = (size_t)bl_buf[i2].stride * 4;
+    if (!src_pitch) src_pitch = (uint32_t)frame_w * 4;
+    /* Copy with a red/blue channel swap: the compositor's buffer holds XRGB
+     * little-endian (B,G,R,X bytes) while the present buffer is scanned as
+     * RGBA. The word swizzle auto-vectorizes to NEON. */
+    for (int y = 0; y < frame_h; y++) {
+        const uint32_t *sp = (const uint32_t *)((const char *)src + (size_t)y * src_pitch);
+        uint32_t *dp = (uint32_t *)((char *)dv + (size_t)y * dpitch);
+        for (int x = 0; x < frame_w; x++) {
+            uint32_t v = sp[x];
+            dp[x] = (v & 0xFF00FF00u) | ((v >> 16) & 0xFFu) | ((v & 0xFFu) << 16);
+        }
+    }
+    hybris_gralloc_unlock(bl_buf[i2].handle);
+
+    pthread_mutex_lock(&hwc2_present_mu);
+    uint32_t nt = 0, nr = 0;
+    int vr = hwc2_compat_display_validate(hwc2_disp, &nt, &nr);
+    if (vr != 0 && vr != 5) {
+        pthread_mutex_unlock(&hwc2_present_mu);
+        static unsigned long vf = 0;
+        if (vf++ < 5) fprintf(stderr, "drmadapter: present_cpu validate failed %d (#%lu)\n", vr, vf);
+        return -1;
+    }
+    if (nt) hwc2_compat_display_accept_changes(hwc2_disp);
+    hwc2_compat_layer_set_buffer(hwc2_layer, (uint32_t)i2, &bl_buf[i2].anwb, -1);
+    hwc2_compat_display_set_client_target(hwc2_disp, (uint32_t)i2, &bl_buf[i2].anwb, -1, 0);
+    int32_t f = -1;
+    hwc2_compat_display_present(hwc2_disp, &f);
+    pthread_mutex_unlock(&hwc2_present_mu);
+    if (f >= 0) close(f);
+
+    if (prof) {
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        static double acc = 0.0; static int n = 0; static struct timespec tfirst;
+        if (n == 0) tfirst = t0;
+        acc += (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        if (++n >= 30) {
+            double wall = (t1.tv_sec - tfirst.tv_sec) * 1e3 + (t1.tv_nsec - tfirst.tv_nsec) / 1e6;
+            fprintf(stderr, "drmadapter: present_cpu avg %.2f ms | %.1f fps (%dx%d)\n",
+                    acc / n, n * 1000.0 / wall, frame_w, frame_h);
+            acc = 0.0; n = 0;
+        }
+    }
+    return 0;
+}
+
+/* Worker-thread plumbing: one pending slot, latest-wins is not allowed --
+ * every queued frame is presented (the enqueuer waits for a free slot, at
+ * most one present ~5ms) so frames are never silently dropped. */
+static pthread_mutex_t pc_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  pc_cv = PTHREAD_COND_INITIALIZER;
+static const void *pc_src = NULL;
+static uint32_t    pc_pitch = 0;
+static int pc_pending = 0, pc_busy = 0, pc_thread_up = 0;
+
+static void *present_cpu_worker(void *ud) {
+    (void)ud;
+    for (;;) {
+        pthread_mutex_lock(&pc_mu);
+        while (!pc_pending)
+            pthread_cond_wait(&pc_cv, &pc_mu);
+        const void *src = pc_src;
+        uint32_t pitch = pc_pitch;
+        pc_pending = 0;
+        pc_busy = 1;
+        pthread_mutex_unlock(&pc_mu);
+
+        present_cpu_sync(src, pitch);
+
+        pthread_mutex_lock(&pc_mu);
+        pc_busy = 0;
+        pthread_cond_broadcast(&pc_cv);
+        pthread_mutex_unlock(&pc_mu);
+    }
+    return NULL;
+}
+
+static int drmadapter_present_cpu(const void *src, uint32_t src_pitch) {
+    if (!hwc2_ready) {
+        /* HWC2 comes up on a background thread and the compositor's first
+         * frames can beat it. Wait briefly instead of dropping them: a dropped
+         * opening frame leaves the panel black until the next damage, and the
+         * caller's fallback path would touch gralloc before it's loaded. */
+        for (int i = 0; i < 60 && !hwc2_ready; i++) usleep(50000);
+    }
+    if (!hwc2_ready || !hwc2_disp || !hwc2_layer || frame_w <= 0) return -1;
+    if (!src) return -1;
+    if (!blit_init()) return -1;
+
+    /* Escape hatch: present synchronously inside the flip call. */
+    static int sync_mode = -1;
+    if (sync_mode < 0) sync_mode = getenv("DRMADAPTER_SYNC_PRESENT") ? 1 : 0;
+    if (sync_mode)
+        return present_cpu_sync(src, src_pitch);
+
+    pthread_mutex_lock(&pc_mu);
+    if (!pc_thread_up) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, present_cpu_worker, NULL) != 0) {
+            pthread_mutex_unlock(&pc_mu);
+            return present_cpu_sync(src, src_pitch);
+        }
+        pthread_detach(t);
+        pc_thread_up = 1;
+    }
+    /* Wait for the slot (bounded): the worker takes ~5ms per frame, always
+     * shorter than the compositor's own frame production. */
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_nsec += 100000000L;                       /* +100ms */
+    if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+    while (pc_pending || pc_busy) {
+        if (pthread_cond_timedwait(&pc_cv, &pc_mu, &dl) == ETIMEDOUT)
+            break;
+    }
+    pc_src = src;
+    pc_pitch = src_pitch;
+    pc_pending = 1;
+    pthread_cond_broadcast(&pc_cv);
+    pthread_mutex_unlock(&pc_mu);
     return 0;
 }
 
@@ -762,8 +926,156 @@ static void drmadapterws_DestroyWindow(EGLNativeWindowType win) {
     dtracef("DestroyWindow win=%p\n", (void*)win);
 }
 
+/* dmabuf import advertisement for KMS-native compositors (KWin).
+ *
+ * KWin builds its buffer-format table exclusively from
+ * EGL_EXT_image_dma_buf_import(_modifiers) + eglQueryDmaBufFormats/ModifiersEXT;
+ * without them the format intersection is empty and output configuration fails
+ * silently before any buffer is even allocated. The hybris stack genuinely
+ * supports these imports -- eglplatformcommon's HYBRIS_WLROOTS bridge converts
+ * EGL_LINUX_DMA_BUF_EXT imports of gbm_hybris buffers into Android native
+ * buffer imports (that is how wlroots renders) -- so advertise the extension
+ * with the formats the bridge maps, LINEAR only (gbm_hybris allocates linear
+ * when GBM_HYBRIS_LINEAR is set, and reports modifier 0). */
+#ifndef DRM_FORMAT_MOD_LINEAR_LOCAL
+#define DRM_FORMAT_MOD_LINEAR_LOCAL 0ull
+#endif
+static const EGLint dmabuf_formats[] = {
+    0x34325258, /* XR24 / DRM_FORMAT_XRGB8888 */
+    0x34325241, /* AR24 / DRM_FORMAT_ARGB8888 */
+    0x34324258, /* XB24 / DRM_FORMAT_XBGR8888 */
+    0x34324241, /* AB24 / DRM_FORMAT_ABGR8888 */
+};
+#define DMABUF_NFORMATS (EGLint)(sizeof(dmabuf_formats) / sizeof(dmabuf_formats[0]))
+
+/* Opt-in via DRMADAPTER_DMABUF. Advertising dmabuf import + LINEAR modifiers is
+ * needed by KMS-native compositors (KWin) to build their buffer-format table.
+ * But wlroots (phoc) reacts to the modifier list by switching its output
+ * allocation to gbm_bo_create_with_modifiers(), which gbm_hybris does not
+ * implement -> the DRM output fails to come up and phosh never paints. So only
+ * the KWin session sets this; phosh/GNOME keep the pre-existing (no-dmabuf)
+ * behaviour untouched. */
+static int dmabuf_ads_enabled(void) {
+    static int e = -1;
+    if (e < 0) e = getenv("DRMADAPTER_DMABUF") ? 1 : 0;
+    return e;
+}
+
+static EGLBoolean drmadapter_eglQueryDmaBufFormatsEXT(EGLDisplay dpy, EGLint max_formats,
+                                                      EGLint *formats, EGLint *num_formats) {
+    (void)dpy;
+    if (getenv("DRMADAPTER_TRACE_EGL"))
+        fprintf(stderr, "drmadapter: eglQueryDmaBufFormatsEXT(max=%d)\n", max_formats);
+    if (!num_formats) return EGL_FALSE;
+    if (max_formats <= 0 || !formats) { *num_formats = DMABUF_NFORMATS; return EGL_TRUE; }
+    EGLint n = max_formats < DMABUF_NFORMATS ? max_formats : DMABUF_NFORMATS;
+    for (EGLint i = 0; i < n; i++) formats[i] = dmabuf_formats[i];
+    *num_formats = n;
+    return EGL_TRUE;
+}
+
+static EGLBoolean drmadapter_eglQueryDmaBufModifiersEXT(EGLDisplay dpy, EGLint format,
+                                                        EGLint max_modifiers, EGLuint64KHR *modifiers,
+                                                        EGLBoolean *external_only, EGLint *num_modifiers) {
+    (void)dpy;
+    if (getenv("DRMADAPTER_TRACE_EGL"))
+        fprintf(stderr, "drmadapter: eglQueryDmaBufModifiersEXT(fmt=0x%x max=%d)\n", format, max_modifiers);
+    int known = 0;
+    for (EGLint i = 0; i < DMABUF_NFORMATS; i++)
+        if (dmabuf_formats[i] == format) { known = 1; break; }
+    if (!known || !num_modifiers) return EGL_FALSE;
+    if (max_modifiers <= 0 || !modifiers) { *num_modifiers = 1; return EGL_TRUE; }
+    modifiers[0] = DRM_FORMAT_MOD_LINEAR_LOCAL;
+    if (external_only) external_only[0] = EGL_FALSE;
+    *num_modifiers = 1;
+    return EGL_TRUE;
+}
+
+/* Alias the ES2 extension names of a handful of buffer-mapping entry points to
+ * their ES3 core implementations (which the Mali libGLESv2 exports). KWin 6's
+ * GL renderer uses glMapBufferRange; on an ES2 context libepoxy will only call
+ * it if it can resolve the GL_EXT_map_buffer_range / GL_OES_mapbuffer suffixed
+ * form. Providing these lets KWin run on the ES2 context that phosh/GNOME use,
+ * instead of an ES3 context -- the Mali ES3 driver path corrupts memory under
+ * KWin's multithreaded rendering (wild jumps into the QtQml heap). Opt-in via
+ * DRMADAPTER_GL_ALIASES so only the KWin session sees the aliases. */
+static int gl_aliases_enabled(void) {
+    static int e = -1;
+    if (e < 0) e = getenv("DRMADAPTER_GL_ALIASES") ? 1 : 0;
+    return e;
+}
+
+/* Diagnostic wrapper: log what libepoxy's version detection sees. If glGetString
+ * returns NULL/garbage here, the context isn't current when KWin renders. */
+static const GLubyte *(*real_glGetString)(GLenum) = NULL;
+static const GLubyte *drmadapter_glGetString(GLenum name) {
+    if (!real_glGetString)
+        real_glGetString = (const GLubyte *(*)(GLenum))
+            eglplatformcommon_eglGetProcAddress("glGetString");
+    const GLubyte *r = real_glGetString ? real_glGetString(name) : NULL;
+    if (getenv("DRMADAPTER_GL_DEBUG"))
+        fprintf(stderr, "drmadapter: glGetString(0x%x)=[%s] ctx=%p draw=%p err=0x%x\n",
+                name, r ? (const char *)r : "(NULL)",
+                (void *)eglGetCurrentContext(),
+                (void *)eglGetCurrentSurface(EGL_DRAW), eglGetError());
+    return r;
+}
+
+/* Serialise shader compile/link with a glFinish. Mali (Valhall) compiles/links
+ * shaders asynchronously on an internal worker thread; KWin keeps issuing GL on
+ * the main thread while that worker runs, which corrupts driver/heap state
+ * (shader link fails with an empty infolog, epoxy's version cache gets
+ * scribbled) -> crash drawing the first client texture. Forcing the worker to
+ * complete before the caller continues avoids the race. glvnd resolves the
+ * vendor's GL entry points through this eglGetProcAddress, so wrapping here
+ * reaches KWin's calls. Opt-in via DRMADAPTER_GL_SYNC_COMPILE. */
+static int gl_sync_compile_enabled(void) {
+    static int e = -1;
+    if (e < 0) e = getenv("DRMADAPTER_GL_SYNC_COMPILE") ? 1 : 0;
+    return e;
+}
+static void (*real_glLinkProgram)(GLuint) = NULL;
+static void (*real_glCompileShader)(GLuint) = NULL;
+static void (*real_glFinish_sc)(void) = NULL;
+static void drmadapter_glLinkProgram(GLuint p) {
+    if (!real_glLinkProgram) real_glLinkProgram = (void(*)(GLuint))eglplatformcommon_eglGetProcAddress("glLinkProgram");
+    if (!real_glFinish_sc)   real_glFinish_sc   = (void(*)(void))eglplatformcommon_eglGetProcAddress("glFinish");
+    if (real_glLinkProgram) real_glLinkProgram(p);
+    if (real_glFinish_sc) real_glFinish_sc();
+}
+static void drmadapter_glCompileShader(GLuint s) {
+    if (!real_glCompileShader) real_glCompileShader = (void(*)(GLuint))eglplatformcommon_eglGetProcAddress("glCompileShader");
+    if (!real_glFinish_sc)     real_glFinish_sc     = (void(*)(void))eglplatformcommon_eglGetProcAddress("glFinish");
+    if (real_glCompileShader) real_glCompileShader(s);
+    if (real_glFinish_sc) real_glFinish_sc();
+}
+
 static __eglMustCastToProperFunctionPointerType
 drmadapterws_eglGetProcAddress(const char *procname) {
+    if (getenv("DRMADAPTER_GL_DEBUG") && strcmp(procname, "glGetString") == 0)
+        return (__eglMustCastToProperFunctionPointerType)drmadapter_glGetString;
+    if (gl_sync_compile_enabled()) {
+        if (strcmp(procname, "glLinkProgram") == 0)
+            return (__eglMustCastToProperFunctionPointerType)drmadapter_glLinkProgram;
+        if (strcmp(procname, "glCompileShader") == 0)
+            return (__eglMustCastToProperFunctionPointerType)drmadapter_glCompileShader;
+    }
+    if (dmabuf_ads_enabled()) {
+        if (strcmp(procname, "eglQueryDmaBufFormatsEXT") == 0)
+            return (__eglMustCastToProperFunctionPointerType)drmadapter_eglQueryDmaBufFormatsEXT;
+        if (strcmp(procname, "eglQueryDmaBufModifiersEXT") == 0)
+            return (__eglMustCastToProperFunctionPointerType)drmadapter_eglQueryDmaBufModifiersEXT;
+    }
+    if (gl_aliases_enabled()) {
+        const char *core = NULL;
+        if      (strcmp(procname, "glMapBufferRangeEXT") == 0)         core = "glMapBufferRange";
+        else if (strcmp(procname, "glFlushMappedBufferRangeEXT") == 0) core = "glFlushMappedBufferRange";
+        else if (strcmp(procname, "glUnmapBufferOES") == 0)            core = "glUnmapBuffer";
+        else if (strcmp(procname, "glMapBufferOES") == 0)              core = "glMapBuffer";
+        else if (strcmp(procname, "glGetBufferPointervOES") == 0)      core = "glGetBufferPointerv";
+        if (core)
+            return eglplatformcommon_eglGetProcAddress(core);
+    }
     return eglplatformcommon_eglGetProcAddress(procname);
 }
 
@@ -775,7 +1087,27 @@ static void drmadapterws_passthroughImageKHR(EGLContext *ctx, EGLenum *target,
 
 static const char *drmadapterws_eglQueryString(EGLDisplay dpy, EGLint name,
     const char *(*real_eglQueryString)(EGLDisplay, EGLint)) {
-    return eglplatformcommon_eglQueryString(dpy, name, real_eglQueryString);
+    const char *ret = eglplatformcommon_eglQueryString(dpy, name, real_eglQueryString);
+    if (getenv("DRMADAPTER_TRACE_EGL") && name == EGL_EXTENSIONS)
+        fprintf(stderr, "drmadapter: eglQueryString(EXTENSIONS) dpy=%p ret=%p\n", (void*)dpy, (void*)ret);
+    if (name == EGL_EXTENSIONS && ret && dmabuf_ads_enabled()) {
+        /* Advertise the dmabuf import path the hybris bridge implements. */
+        static char extbuf[4096];
+        if (!strstr(ret, "EGL_EXT_image_dma_buf_import_modifiers")) {
+            const char *base = strstr(ret, "EGL_EXT_image_dma_buf_import") ? "" : " EGL_EXT_image_dma_buf_import";
+            snprintf(extbuf, sizeof extbuf,
+                     "%s%s EGL_EXT_image_dma_buf_import_modifiers", ret, base);
+            if (getenv("DRMADAPTER_TRACE_EGL")) {
+                size_t l = strlen(extbuf);
+                fprintf(stderr, "drmadapter: extensions APPENDED, tail: ...%s\n",
+                        extbuf + (l > 100 ? l - 100 : 0));
+            }
+            return extbuf;
+        }
+        if (getenv("DRMADAPTER_TRACE_EGL"))
+            fprintf(stderr, "drmadapter: extensions already contain dma_buf_import\n");
+    }
+    return ret;
 }
 
 static void drmadapterws_prepareSwap(EGLDisplay dpy, EGLNativeWindowType win,
