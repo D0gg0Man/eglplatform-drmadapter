@@ -1,0 +1,5 @@
+Qt_6 {
+    global:
+        _ZN8QPainter9drawImageERK6QRectFRK6QImageS2_6QFlagsIN2Qt19ImageConversionFlagEE;
+    local: *;
+};
