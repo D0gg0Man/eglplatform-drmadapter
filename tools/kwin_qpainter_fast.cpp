@@ -96,6 +96,51 @@ static inline void row_over(uint32_t *d, const uint32_t *s, int n)
     }
 }
 
+
+/* One helper thread: large blits are split row-wise between the caller and
+ * the helper (both pinned with KWin to the big cluster), halving fullscreen
+ * composite time. Small rects are not worth the wakeup. */
+#include <pthread.h>
+struct BlitJob {
+    const uchar *sbits; uchar *dbits;
+    qsizetype spitch, dpitch;
+    int sx, sy, dx, dy, w, h;
+    bool blend;
+};
+static pthread_mutex_t job_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  job_cv = PTHREAD_COND_INITIALIZER;
+static BlitJob job;
+static int job_pending = 0, job_done = 1, helper_up = 0;
+
+static void blit_rows(const BlitJob *j)
+{
+    for (int y = 0; y < j->h; y++) {
+        const uchar *srow = j->sbits + (qsizetype)(j->sy + y) * j->spitch + (qsizetype)j->sx * 4;
+        uchar *drow = j->dbits + (qsizetype)(j->dy + y) * j->dpitch + (qsizetype)j->dx * 4;
+        if (j->blend)
+            row_over((uint32_t *)drow, (const uint32_t *)srow, j->w);
+        else
+            memcpy(drow, srow, (size_t)j->w * 4);
+    }
+}
+static void *blit_helper(void *)
+{
+    for (;;) {
+        pthread_mutex_lock(&job_mu);
+        while (!job_pending)
+            pthread_cond_wait(&job_cv, &job_mu);
+        BlitJob j = job;
+        job_pending = 0;
+        pthread_mutex_unlock(&job_mu);
+        blit_rows(&j);
+        pthread_mutex_lock(&job_mu);
+        job_done = 1;
+        pthread_cond_broadcast(&job_cv);
+        pthread_mutex_unlock(&job_mu);
+    }
+    return nullptr;
+}
+
 static bool try_fast_blit(QPainter *p, const QRectF &targetRect,
                           const QImage &image, const QRectF &sourceRect)
 {
@@ -182,14 +227,43 @@ static bool try_fast_blit(QPainter *p, const QRectF &targetRect,
         const int sx = r.x() - devT.x() + srcOrigin.x();
         const int sy = r.y() - devT.y() + srcOrigin.y();
         st.real_px += (unsigned long)r.width() * (unsigned long)r.height();
-        for (int y = 0; y < r.height(); y++) {
-            const uchar *srow = sbits + (qsizetype)(sy + y) * spitch + (qsizetype)sx * 4;
-            uchar *drow = dbits + (qsizetype)(r.y() + y) * dpitch + (qsizetype)r.x() * 4;
-            if (blend)
-                row_over((uint32_t *)drow, (const uint32_t *)srow, r.width());
-            else
-                memcpy(drow, srow, (size_t)r.width() * 4);
+
+        BlitJob whole = { sbits, dbits, spitch, dpitch,
+                          sx, sy, r.x(), r.y(), r.width(), r.height(), blend };
+        if ((unsigned long)r.width() * (unsigned long)r.height() >= 300000 && r.height() >= 8) {
+            pthread_mutex_lock(&job_mu);
+            if (!helper_up) {
+                pthread_t t;
+                if (pthread_create(&t, nullptr, blit_helper, nullptr) == 0) {
+                    pthread_detach(t);
+                    helper_up = 1;
+                }
+            }
+            if (helper_up) {
+                const int split = r.height() / 2;
+                BlitJob top = whole;
+                top.h = split;
+                job = top;
+                job_pending = 1;
+                job_done = 0;
+                pthread_cond_broadcast(&job_cv);
+                pthread_mutex_unlock(&job_mu);
+
+                BlitJob bottom = whole;
+                bottom.sy += split;
+                bottom.dy += split;
+                bottom.h -= split;
+                blit_rows(&bottom);
+
+                pthread_mutex_lock(&job_mu);
+                while (!job_done)
+                    pthread_cond_wait(&job_cv, &job_mu);
+                pthread_mutex_unlock(&job_mu);
+                continue;
+            }
+            pthread_mutex_unlock(&job_mu);
         }
+        blit_rows(&whole);
     }
     clock_gettime(CLOCK_MONOTONIC, &bb);
     st.blit_ns += (unsigned long)((bb.tv_sec - ba.tv_sec) * 1000000000L + (bb.tv_nsec - ba.tv_nsec));

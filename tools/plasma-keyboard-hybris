@@ -1,0 +1,14 @@
+#!/bin/bash
+# KWin spawns the input method with the COMPOSITOR's environment; fix it up
+# for a hybris GL client before starting the keyboard.
+export HYBRIS_EGLPLATFORM=wayland
+export HYBRIS_WL_SHM=1
+export HYBRIS_WL_SHM_XRGB=auto
+export HYBRIS_SWAP_INTERVAL=0
+export QSG_RENDER_LOOP=threaded
+export QSG_RHI_BACKEND=opengl
+export QT_QPA_PLATFORMTHEME=kde
+unset KWIN_COMPOSE HYBRIS_WLROOTS LIBDRM_HYBRIS_FAKE_KMS_STATE LIBDRM_HYBRIS_PROF \
+      LIBDRM_HYBRIS_FAST_COMPLETE KWIN_QPAINTER_FAST KWIN_QPAINTER_FAST_DEBUG \
+      LD_PRELOAD XDG_CONFIG_HOME KWIN_DRM_DEVICES KWIN_DRM_NO_AMS KWIN_DRM_NO_DIRECT_SCANOUT
+exec /usr/bin/plasma-keyboard "$@"
