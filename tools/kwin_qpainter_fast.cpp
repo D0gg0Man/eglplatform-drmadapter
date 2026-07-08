@@ -67,6 +67,15 @@ static inline void row_over(uint32_t *d, const uint32_t *s, int n)
 #if defined(__ARM_NEON) || defined(__aarch64__)
     for (; x + 8 <= n; x += 8) {
         uint8x8x4_t sp = vld4_u8((const uint8_t *)(s + x));
+        /* Overlay surfaces (gesture bars, OSDs) are mostly fully transparent
+         * or fully opaque: handle both without the blend math. */
+        const uint64_t abits = vget_lane_u64(vreinterpret_u64_u8(sp.val[3]), 0);
+        if (abits == 0)
+            continue;
+        if (abits == ~0ull) {
+            vst4_u8((uint8_t *)(d + x), sp);
+            continue;
+        }
         uint8x8x4_t dp = vld4_u8((const uint8_t *)(d + x));
         uint8x8_t inva = vmvn_u8(sp.val[3]);
         for (int c = 0; c < 4; c++) {
