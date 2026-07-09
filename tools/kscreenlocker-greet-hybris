@@ -1,0 +1,24 @@
+#!/bin/bash
+# KWin spawns kscreenlocker_greet with the COMPOSITOR's environment
+# (drmadapter EGL platform, kwin config home, LD_PRELOAD shims). A GL client
+# needs the hybris wl_shm client env instead, or the lock screen renders black
+# and the device is soft-bricked (locked, no visible PIN pad). Fix the env,
+# then exec the real greeter (diverted to .distrib by dpkg-divert).
+export HYBRIS_EGLPLATFORM=wayland
+export HYBRIS_WL_SHM=1
+export HYBRIS_WL_SHM_XRGB=auto
+export HYBRIS_SWAP_INTERVAL=0
+export GBM_BACKEND=hybris
+export GBM_BACKENDS_PATH=/usr/lib/aarch64-linux-gnu/gbm
+export GBM_HYBRIS_LINEAR=1
+export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_libhybris.json
+export QSG_RENDER_LOOP=threaded
+export QSG_RHI_BACKEND=opengl
+export QT_QPA_PLATFORM=wayland
+export QT_QPA_PLATFORMTHEME=kde
+export PLASMA_PLATFORM=phone:handset
+unset KWIN_COMPOSE HYBRIS_WLROOTS LIBDRM_HYBRIS_FAKE_KMS_STATE LIBDRM_HYBRIS_PROF \
+      LIBDRM_HYBRIS_FAST_COMPLETE KWIN_QPAINTER_FAST KWIN_QPAINTER_FAST_DEBUG \
+      DRMADAPTER_PROF LD_PRELOAD XDG_CONFIG_HOME KWIN_DRM_DEVICES KWIN_DRM_NO_AMS \
+      KWIN_DRM_NO_DIRECT_SCANOUT
+exec /usr/lib/aarch64-linux-gnu/libexec/kscreenlocker_greet.distrib "$@"
