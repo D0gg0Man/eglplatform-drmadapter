@@ -1,0 +1,17 @@
+// Single-user device: allow the furios session user to power off / reboot /
+// suspend without a polkit auth agent. Without this, the power menu tears the
+// session down but logind returns "challenge" and never powers off (the
+// hand-rolled session is not the seat's active session from logind's view).
+polkit.addRule(function(action, subject) {
+    if (subject.user === "furios" &&
+        (action.id === "org.freedesktop.login1.power-off" ||
+         action.id === "org.freedesktop.login1.power-off-multiple-sessions" ||
+         action.id === "org.freedesktop.login1.reboot" ||
+         action.id === "org.freedesktop.login1.reboot-multiple-sessions" ||
+         action.id === "org.freedesktop.login1.suspend" ||
+         action.id === "org.freedesktop.login1.suspend-multiple-sessions" ||
+         action.id === "org.freedesktop.login1.hibernate" ||
+         action.id === "org.freedesktop.login1.hibernate-multiple-sessions")) {
+        return polkit.Result.YES;
+    }
+});
